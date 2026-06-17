@@ -99,7 +99,17 @@ def _mxfp8_dot_scaled_linear(
         if hip_out is not None:
             return hip_out
     out = torch.empty((M, N), dtype=x.dtype, device=x.device)
-    BLOCK_M, BLOCK_N, BLOCK_K = 64, 128, 128
+    # TUNED (MXFP8 dense GEMM, MI355X/gfx950). Small M (decode / EAGLE3
+    # spec-verify, M<=64): BLOCK_K=256 halves the e8m0 scale loads, BLOCK_M=32
+    # stops the 64-row tile wasting half its rows at M=32, num_warps=4 keeps
+    # occupancy. ~1.54x in a real torch-profiler trace (33.9->22.0 us/call @
+    # 8k-c8 MTP, K=6144; ~-10% E2E decode TPOT; gsm8k 98.3%). Large M (prefill)
+    # keeps the original 64/128/128 + w8 tile. Dense-only: do NOT port BLOCK_K=256
+    # to the MoE grouped GEMM (it is BW-bound and regresses).
+    if M <= 64:
+        BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages = 32, 64, 256, 4, 2
+    else:
+        BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages = 64, 128, 128, 8, 1
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
     _mxfp8_linear_kernel[grid](
         x_q,
@@ -123,7 +133,8 @@ def _mxfp8_dot_scaled_linear(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
-        num_warps=8,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return out
 
