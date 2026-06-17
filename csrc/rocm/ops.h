@@ -46,3 +46,19 @@ void paged_attention(
     const std::string& kv_cache_dtype, torch::Tensor& k_scale,
     torch::Tensor& v_scale, const std::optional<torch::Tensor>& fp8_out_scale,
     const std::string& mfma_type);
+
+// MiniMax-M3 decode small-M MXFP8 (e4m3 + e8m0 1x32) kernels (gfx950).
+at::Tensor smallm_mxfp8_gemv(at::Tensor Xq, at::Tensor Xs, at::Tensor Wq,
+                             at::Tensor Ws, c10::ScalarType out_dtype,
+                             int64_t block_n);
+
+at::Tensor smallm_mxfp8_mfma(at::Tensor Xq, at::Tensor Xs, at::Tensor Wq,
+                             at::Tensor Ws, c10::ScalarType out_dtype,
+                             int64_t n_sub, int64_t k_splits);
+
+void smallm_mxfp8_moe_grouped_gemm(
+    at::Tensor a_q, at::Tensor a_scale, at::Tensor w, at::Tensor w_scale,
+    at::Tensor sorted_token_ids, at::Tensor expert_ids,
+    at::Tensor num_tokens_post_padded, at::Tensor out, int64_t E, int64_t N,
+    int64_t K, int64_t num_valid_tokens, int64_t M_act, int64_t a_div,
+    int64_t block_m, c10::optional<at::Tensor> mul_weight_by);

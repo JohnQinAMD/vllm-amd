@@ -88,6 +88,16 @@ def _mxfp8_dot_scaled_linear(
     M, K = x.shape
     N = w.shape[0]
     x_q, x_scale = mxfp8_e4m3_quantize(x)
+    # Decode small-M HIP GEMV (gfx950); None outside its measured envelope (or
+    # on failure) -> Triton dot_scaled below.
+    if current_platform.supports_mx():
+        from vllm.model_executor.layers.quantization.utils.mxfp8_smallm import (
+            mxfp8_gemv,
+        )
+
+        hip_out = mxfp8_gemv(x_q, x_scale, w, w_scale, x.dtype)
+        if hip_out is not None:
+            return hip_out
     out = torch.empty((M, N), dtype=x.dtype, device=x.device)
     BLOCK_M, BLOCK_N, BLOCK_K = 64, 128, 128
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))

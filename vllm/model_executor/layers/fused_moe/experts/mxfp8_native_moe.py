@@ -125,7 +125,7 @@ def _mxfp8_grouped_gemm_kernel(
     )
 
 
-def _grouped_gemm_mxfp8(
+def _grouped_gemm_mxfp8_triton(
     a_q: torch.Tensor,  # [M, K] fp8 e4m3
     a_scale: torch.Tensor,  # [M, K//32] uint8 (E8M0)
     w: torch.Tensor,  # [E, N, K] fp8 e4m3
@@ -188,6 +188,71 @@ def _grouped_gemm_mxfp8(
     return out
 
 
+def _grouped_gemm_mxfp8(
+    a_q: torch.Tensor,
+    a_scale: torch.Tensor,
+    w: torch.Tensor,
+    w_scale: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    num_valid_tokens: int,
+    top_k: int,
+    block_m: int,
+    out_dtype: torch.dtype,
+    a_div: int,
+    mul_weight_by: torch.Tensor | None = None,
+    expert_map: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Decode grouped GEMM dispatcher: on gfx950, try the small-M HIP kernel
+    (``_rocm_C``); else fall back to the Triton ``dot_scaled`` path.
+
+    The HIP wrapper returns ``None`` outside its measured envelope (or on any
+    failure), so this degrades cleanly. Expert parallelism (``expert_map`` set)
+    always uses Triton.
+    """
+    if topk_ids is not None and expert_map is None and current_platform.supports_mx():
+        from vllm.model_executor.layers.quantization.utils.mxfp8_smallm import (
+            grouped_gemm_mxfp8 as _hip_grouped_gemm,
+        )
+
+        out = _hip_grouped_gemm(
+            a_q,
+            a_scale,
+            w,
+            w_scale,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            num_valid_tokens,
+            top_k,
+            block_m,
+            out_dtype,
+            a_div,
+            mul_weight_by,
+            topk_ids=topk_ids,
+        )
+        if out is not None:
+            return out
+    return _grouped_gemm_mxfp8_triton(
+        a_q,
+        a_scale,
+        w,
+        w_scale,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        num_valid_tokens,
+        top_k,
+        block_m,
+        out_dtype,
+        a_div,
+        mul_weight_by,
+        expert_map,
+    )
+
+
 def fused_moe_mxfp8_native(
     hidden_states: torch.Tensor,  # [T, H] bf16
     w13: torch.Tensor,  # [E, 2I, H] fp8
@@ -232,6 +297,7 @@ def fused_moe_mxfp8_native(
         hidden_states.dtype,
         a_div=top_k,
         expert_map=expert_map,
+        topk_ids=topk_ids,
     )  # [M, 2I]
 
     # SwiGLU-OAI (split layout: gate=g1[:, :I], up=g1[:, I:]) FUSED with the
@@ -260,6 +326,7 @@ def fused_moe_mxfp8_native(
         a_div=1,
         mul_weight_by=topk_weights.reshape(-1).to(torch.float32),
         expert_map=expert_map,
+        topk_ids=topk_ids,
     )  # [M, H] == [T*top_k, H]
 
     return g2.view(T, top_k, H).sum(dim=1).to(hidden_states.dtype)

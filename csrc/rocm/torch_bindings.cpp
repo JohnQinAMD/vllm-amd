@@ -80,6 +80,26 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "                Tensor? fp8_out_scale,"
       "                str mfma_type) -> ()");
   rocm_ops.impl("paged_attention", torch::kCUDA, &paged_attention);
+
+  // MiniMax-M3 decode small-M MXFP8 GEMMs (gfx950).
+  rocm_ops.def(
+      "smallm_mxfp8_gemv(Tensor Xq, Tensor Xs, Tensor Wq, Tensor Ws, "
+      "ScalarType out_dtype, int block_n) -> Tensor");
+  rocm_ops.impl("smallm_mxfp8_gemv", torch::kCUDA, &smallm_mxfp8_gemv);
+
+  rocm_ops.def(
+      "smallm_mxfp8_mfma(Tensor Xq, Tensor Xs, Tensor Wq, Tensor Ws, "
+      "ScalarType out_dtype, int n_sub, int k_splits) -> Tensor");
+  rocm_ops.impl("smallm_mxfp8_mfma", torch::kCUDA, &smallm_mxfp8_mfma);
+
+  rocm_ops.def(
+      "smallm_mxfp8_moe_grouped_gemm(Tensor a_q, Tensor a_scale, Tensor w, "
+      "Tensor w_scale, Tensor sorted_token_ids, Tensor expert_ids, "
+      "Tensor num_tokens_post_padded, Tensor! out, int E, int N, int K, "
+      "int num_valid_tokens, int M_act, int a_div, int block_m, "
+      "Tensor? mul_weight_by) -> ()");
+  rocm_ops.impl("smallm_mxfp8_moe_grouped_gemm", torch::kCUDA,
+                &smallm_mxfp8_moe_grouped_gemm);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

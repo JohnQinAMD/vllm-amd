@@ -1359,7 +1359,20 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   set(VLLM_ROCM_EXT_SRC
     "csrc/rocm/torch_bindings.cpp"
     "csrc/rocm/skinny_gemms.cu"
-    "csrc/rocm/attention.cu")
+    "csrc/rocm/attention.cu"
+    "csrc/rocm/mxfp8/smallm_mxfp8_dense.cu"
+    "csrc/rocm/mxfp8/smallm_mxfp8_dense_mfma.cu"
+    "csrc/rocm/mxfp8/smallm_mxfp8_moe.cu")
+
+  # The decode small-M MXFP8 kernels are register-pinned; force full inlining
+  # (matches the original gfx950 tuning). gfx950-only device code is guarded
+  # behind `#if defined(__gfx950__)`, so they compile inert on other arches.
+  set_source_files_properties(
+    "csrc/rocm/mxfp8/smallm_mxfp8_dense.cu"
+    "csrc/rocm/mxfp8/smallm_mxfp8_dense_mfma.cu"
+    "csrc/rocm/mxfp8/smallm_mxfp8_moe.cu"
+    PROPERTIES COMPILE_FLAGS
+    "-mllvm -amdgpu-early-inline-all=true -mllvm -amdgpu-function-calls=false")
 
   set(VLLM_ROCM_HAS_GFX1100 OFF)
   if(VLLM_GPU_ARCHES MATCHES "gfx1100")
