@@ -38,6 +38,9 @@ from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
 logger = init_logger(__name__)
 
+_KIMI_K3_W13_SEPARATED = "gate_up_separated_preshuffled"
+_KIMI_K3_W13_INTERLEAVED = "gate_up_interleaved_preshuffled"
+
 
 class Mxfp4Config(QuantizationConfig):
     """Canonical base config for MXFP4 quantization.
@@ -804,6 +807,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         replace_parameter(layer, "w2_weight_scale", w2_scale)
         layer.w13_weight.is_shuffled = True
         layer.w2_weight.is_shuffled = True
+        layer.w13_weight.kimi_k3_w13_layout = (
+            _KIMI_K3_W13_INTERLEAVED if guinterleave else _KIMI_K3_W13_SEPARATED
+        )
 
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         if self.moe_quant_config is not None and self.experts_cls is not None:

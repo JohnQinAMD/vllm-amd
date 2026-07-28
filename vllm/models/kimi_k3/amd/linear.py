@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
@@ -20,6 +20,9 @@ from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+    SharedExpertsOrder,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -68,6 +71,9 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.math_utils import cdiv
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from aiter.ops.flydsl.kimi_k3_moe_handoff import KimiK3MXFP4ExpertRequest
 
 
 class KimiMLP(nn.Module):
@@ -176,6 +182,91 @@ class KimiAMDLatentMoERunner(MoERunner):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._skip_next_routed_output_transform = False
+
+    def _make_prepared_route_request(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> "KimiK3MXFP4ExpertRequest | None":
+        """Select the exact Kimi-K3 MXFP4 handoff once, or preserve fallback."""
+
+        if not rocm_aiter_ops.is_enabled():
+            return None
+
+        from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+        quant_method = self.routed_experts.quant_method
+        if (
+            not isinstance(quant_method, Mxfp4MoEMethod)
+            or not quant_method.is_k3_situ_aiter
+        ):
+            return None
+
+        correction_bias = self.routed_experts.e_score_correction_bias
+        situ_beta = self.moe_config.activation_situ_beta
+        situ_linear_beta = self.moe_config.activation_situ_linear_beta
+        if (
+            not isinstance(correction_bias, torch.Tensor)
+            or situ_beta is None
+            or situ_linear_beta is None
+        ):
+            return None
+
+        try:
+            from aiter.ops.flydsl.kimi_k3_moe_handoff import (
+                KimiK3MXFP4ExpertRequest,
+                supports_kimi_k3_mxfp4_expert_handoff,
+            )
+        except (ImportError, ModuleNotFoundError):
+            return None
+
+        request = KimiK3MXFP4ExpertRequest(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            correction_bias=correction_bias,
+            w1=self.routed_experts.w13_weight,
+            w2=self.routed_experts.w2_weight,
+            w1_scale=self.routed_experts.w13_weight_scale,
+            w2_scale=self.routed_experts.w2_weight_scale,
+            situ_beta=float(situ_beta),
+            situ_linear_beta=float(situ_linear_beta),
+        )
+        return request if supports_kimi_k3_mxfp4_expert_handoff(request) else None
+
+    def _apply_quant_method(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+        input_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        request = self._make_prepared_route_request(hidden_states, router_logits)
+        if request is None:
+            return super()._apply_quant_method(
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+            )
+
+        # Preserve the generic runner's shared-expert ordering while keeping
+        # prepared route metadata local to this one synchronous call.
+        self._maybe_apply_shared_experts(
+            shared_experts_input, SharedExpertsOrder.NO_OVERLAP
+        )
+        from aiter.ops.flydsl.kimi_k3_moe_handoff import (
+            kimi_k3_mxfp4_expert_handoff,
+        )
+
+        result = kimi_k3_mxfp4_expert_handoff(request)
+        self._maybe_apply_shared_experts(
+            shared_experts_input,
+            SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
+        )
+        shared_output = (
+            self._shared_experts.output if self._shared_experts is not None else None
+        )
+        return shared_output, result.expert_output
 
     def _maybe_apply_routed_scale_to_output(
         self,
