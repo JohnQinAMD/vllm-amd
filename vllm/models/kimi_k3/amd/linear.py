@@ -18,7 +18,6 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     fused_moe_make_expert_params_mapping,
 )
-from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -62,6 +61,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.models.kimi_k3.amd.ops.attn_res import attn_res
+from vllm.models.kimi_k3.amd.ops.moe_gate import KimiK3AiterGateLinear
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.math_utils import cdiv
@@ -202,7 +202,7 @@ class KimiMoE(nn.Module):
         )
 
         # Route with fp32 logits for numerically stable expert selection.
-        self.gate = GateLinear(
+        self.gate = KimiK3AiterGateLinear(
             input_size=hidden_size,
             output_size=num_experts,
             bias=False,
