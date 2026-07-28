@@ -24,6 +24,7 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 _HEADS = 12
 _DIM = 128
 _CONV_WIDTH = 4
+_CHANNELS = 3 * _HEADS * _DIM
 _MAX_FUSED_BATCH = 16
 
 _FusedDecode = Callable[..., torch.Tensor]
@@ -79,6 +80,26 @@ def _matches_cache(
     )
 
 
+def _matches_conv_state(tensor: torch.Tensor) -> bool:
+    """Match either canonical vLLM convolution-cache layout.
+
+    The AITER kernel consumes explicit strides. A ``DS`` cache is already
+    contiguous as ``[slot, channel, width]``; vLLM's default ``SD`` cache
+    becomes a strided view with channel contiguous after the required
+    transpose.
+    """
+    return (
+        tensor.ndim == 3
+        and tensor.shape[1:] == (_CHANNELS, _CONV_WIDTH - 1)
+        and tensor.dtype == torch.bfloat16
+        and tensor.stride()[1:]
+        in (
+            (_CONV_WIDTH - 1, 1),
+            (1, _CHANNELS),
+        )
+    )
+
+
 def _has_fused_decode_layout(
     *,
     f_a: torch.Tensor,
@@ -97,7 +118,7 @@ def _has_fused_decode_layout(
 ) -> bool:
     """Check the measured Kimi-K3 TP8 BF16 tensor contract."""
     batch = f_a.shape[0] if f_a.ndim == 2 else 0
-    channels = 3 * _HEADS * _DIM
+    channels = _CHANNELS
     device = f_a.device
     tensors = (
         f_b_weight,
@@ -141,12 +162,7 @@ def _has_fused_decode_layout(
                 dtype=torch.float32,
                 inner_strides=(1,),
             ),
-            _matches_cache(
-                conv_state,
-                trailing_shape=(channels, _CONV_WIDTH - 1),
-                dtype=torch.bfloat16,
-                inner_strides=(_CONV_WIDTH - 1, 1),
-            ),
+            _matches_conv_state(conv_state),
             _matches_tensor(
                 raw_beta,
                 shape=(1, batch, _HEADS),

@@ -17,6 +17,7 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 _BATCH = 2
 _HEADS = 12
 _DIM = 128
+_CONV_WIDTH = 4
 _CHANNELS = 3 * _HEADS * _DIM
 
 
@@ -25,8 +26,17 @@ def _layout_inputs() -> dict[str, torch.Tensor]:
         "f_a": torch.empty(_BATCH, _DIM, dtype=torch.bfloat16),
         "f_b_weight": torch.empty(_HEADS * _DIM, _DIM, dtype=torch.bfloat16),
         "mixed_qkv": torch.empty(_BATCH, _CHANNELS, dtype=torch.bfloat16),
-        "conv_weight": torch.empty(_CHANNELS, 4, dtype=torch.float32),
-        "conv_state": torch.empty(4, _CHANNELS, 3, dtype=torch.bfloat16),
+        "conv_weight": torch.empty(
+            _CHANNELS,
+            _CONV_WIDTH,
+            dtype=torch.float32,
+        ),
+        "conv_state": torch.empty(
+            4,
+            _CHANNELS,
+            _CONV_WIDTH - 1,
+            dtype=torch.bfloat16,
+        ),
         "raw_beta": torch.empty(1, _BATCH, _HEADS, dtype=torch.bfloat16),
         "A_log": torch.empty(_HEADS, dtype=torch.float32),
         "dt_bias": torch.empty(_HEADS * _DIM, dtype=torch.float32),
@@ -48,6 +58,19 @@ def test_aiter_kda_fb_layout_accepts_measured_contract() -> None:
     assert _has_fused_decode_layout(**_layout_inputs())
 
 
+def test_aiter_kda_fb_layout_accepts_default_sd_cache_view() -> None:
+    inputs = _layout_inputs()
+    sd_cache = torch.empty(
+        4,
+        _CONV_WIDTH - 1,
+        _CHANNELS,
+        dtype=torch.bfloat16,
+    )
+    inputs["conv_state"] = sd_cache.transpose(1, 2)
+    assert inputs["conv_state"].stride()[1:] == (1, _CHANNELS)
+    assert _has_fused_decode_layout(**inputs)
+
+
 def test_aiter_kda_fb_layout_selects_fallback_for_unmeasured_input() -> None:
     inputs = _layout_inputs()
     inputs["f_b_weight"] = inputs["f_b_weight"].transpose(0, 1)
@@ -59,6 +82,15 @@ def test_aiter_kda_fb_layout_selects_fallback_for_unmeasured_input() -> None:
 
     inputs = _layout_inputs()
     inputs["state_indices"] = torch.empty((), dtype=torch.int32)
+    assert not _has_fused_decode_layout(**inputs)
+
+    inputs = _layout_inputs()
+    inputs["conv_state"] = torch.empty(
+        4,
+        _CHANNELS,
+        2 * (_CONV_WIDTH - 1),
+        dtype=torch.bfloat16,
+    )[:, :, ::2]
     assert not _has_fused_decode_layout(**inputs)
 
 
@@ -97,9 +129,11 @@ def test_aiter_kda_fb_request_selects_only_measured_decode(
 
 
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-only AITER kernel")
+@pytest.mark.parametrize("conv_layout", ["DS", "SD"])
 @torch.inference_mode()
 def test_aiter_kda_fb_adapter_matches_unfused_api(
     monkeypatch: pytest.MonkeyPatch,
+    conv_layout: str,
 ) -> None:
     ops = amd_kda._load_aiter_kda_fb()
     if ops is None:
@@ -128,16 +162,21 @@ def test_aiter_kda_fb_adapter_matches_unfused_api(
     )
     conv_weight = 0.1 * torch.randn(
         _CHANNELS,
-        4,
+        _CONV_WIDTH,
         dtype=torch.float32,
         device="cuda",
     )
-    conv_seed = torch.randn(
+    conv_seed_ds = torch.randn(
         slots,
         _CHANNELS,
-        3,
+        _CONV_WIDTH - 1,
         dtype=torch.bfloat16,
         device="cuda",
+    )
+    conv_seed = (
+        conv_seed_ds
+        if conv_layout == "DS"
+        else conv_seed_ds.transpose(1, 2).contiguous()
     )
     beta = torch.randn(1, batch, _HEADS, dtype=torch.bfloat16, device="cuda")
     A_log = torch.randn(_HEADS, dtype=torch.float32, device="cuda")
@@ -179,7 +218,11 @@ def test_aiter_kda_fb_adapter_matches_unfused_api(
             {"attn_metadata": {"layer": metadata}},
         )(),
     )
-    monkeypatch.setattr(amd_kda, "is_conv_state_dim_first", lambda: True)
+    monkeypatch.setattr(
+        amd_kda,
+        "is_conv_state_dim_first",
+        lambda: conv_layout == "DS",
+    )
 
     layer = object.__new__(KimiGatedDeltaNetAttention)
     torch.nn.Module.__init__(layer)
@@ -193,7 +236,7 @@ def test_aiter_kda_fb_adapter_matches_unfused_api(
     layer.conv1d = torch.nn.Conv1d(
         _CHANNELS,
         _CHANNELS,
-        kernel_size=4,
+        kernel_size=_CONV_WIDTH,
         groups=_CHANNELS,
         bias=False,
         device="cuda",
@@ -229,7 +272,12 @@ def test_aiter_kda_fb_adapter_matches_unfused_api(
         out=actual,
     )
 
-    conv_expected = conv_seed.clone()
+    conv_expected_cache = conv_seed.clone()
+    conv_expected = (
+        conv_expected_cache
+        if conv_layout == "DS"
+        else conv_expected_cache.transpose(1, 2)
+    )
     recurrent_expected = recurrent_seed.clone()
     raw_g = F.linear(f_a, f_b_weight).view(1, batch, _HEADS, _DIM)
     expected = flydsl_kimi_k3_kda_decode(
@@ -257,4 +305,4 @@ def test_aiter_kda_fb_adapter_matches_unfused_api(
         atol=1e-6,
         rtol=1e-3,
     )
-    assert torch.equal(conv_actual, conv_expected)
+    assert torch.equal(conv_actual, conv_expected_cache)
