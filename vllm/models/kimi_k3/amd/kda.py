@@ -298,7 +298,7 @@ class KimiGatedDeltaNetAttention(_KimiGatedDeltaNetAttention):
             )
 
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
-        output[:] = self.o_proj(core_attn_out)[0]
+        self.o_proj(core_attn_out, output=output)
 
     @eager_break_during_capture
     def _try_aiter_kda_fb_decode(
