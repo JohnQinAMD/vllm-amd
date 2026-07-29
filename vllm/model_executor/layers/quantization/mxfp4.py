@@ -534,6 +534,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         self._cache_permute_indices: dict[torch.Size, torch.Tensor] = {}
         self.moe_kernel: mk.FusedMoEKernel | None = None
+        self.kimi_k3_w13_layout: str | None = None
+        self.kimi_k3_weights_shuffled = False
+        self.kimi_k3_persistent_moe_supported = False
 
         # Used for triton kernel precision configs
         self.w13_precision_config = None
@@ -769,6 +772,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if w13_bias is not None and w2_bias is not None:
             replace_parameter(layer, "w13_bias", w13_bias)
             replace_parameter(layer, "w2_bias", w2_bias)
+
+        if self.mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16:
+            self.kimi_k3_w13_layout = "gate_up_interleaved_preshuffled"
+            self.kimi_k3_weights_shuffled = True
+            self.kimi_k3_persistent_moe_supported = True
 
         # Build quant config
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
