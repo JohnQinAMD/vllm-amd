@@ -445,7 +445,7 @@ class KimiMLAAttention(nn.Module):
         hidden_states: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
-        output[:] = self.mla_attn(positions, hidden_states)
+        self.mla_attn(positions, hidden_states, output=output)
 
 
 class KimiDecoderLayer(nn.Module):

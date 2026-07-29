@@ -664,6 +664,40 @@ class GroupCoordinator:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_reduce(input_)
 
+    def all_reduce_into(
+        self,
+        input_: torch.Tensor,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """All-reduce into a stable output tensor without a custom-op call."""
+
+        if (
+            output.shape != input_.shape
+            or output.dtype != input_.dtype
+            or output.device != input_.device
+            or not output.is_contiguous()
+        ):
+            raise ValueError(
+                "all-reduce output must be a contiguous tensor matching "
+                "the input's shape, dtype, and device"
+            )
+        if self.world_size == 1:
+            output.copy_(input_)
+            return output
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+
+        implementation = getattr(
+            self.device_communicator,
+            "all_reduce_into",
+            None,
+        )
+        if implementation is not None:
+            return implementation(input_, output)
+
+        output.copy_(self.device_communicator.all_reduce(input_))
+        return output
+
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.
