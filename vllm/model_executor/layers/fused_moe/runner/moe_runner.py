@@ -43,6 +43,9 @@ from vllm.model_executor.layers.fused_moe.router.zero_expert_router import (
 from vllm.model_executor.layers.fused_moe.runner.moe_runner_interface import (
     MoERunnerInterface,
 )
+from vllm.model_executor.layers.fused_moe.runner.prepared_moe import (
+    PreparedMoEBackend,
+)
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
     SharedExpertsOrder,
@@ -254,6 +257,7 @@ class MoERunner(MoERunnerInterface):
         routed_input_transform: torch.nn.Module | None = None,
         routed_output_transform: torch.nn.Module | None = None,
         routed_scaling_factor: float = 1.0,
+        prepared_moe_backend: PreparedMoEBackend | None = None,
     ):
         super().__init__()
         self.moe_config = moe_config
@@ -264,6 +268,7 @@ class MoERunner(MoERunnerInterface):
         self.gate = gate
         self.shared_expert_gate = shared_expert_gate
         self.routed_experts = routed_experts
+        self.prepared_moe_backend = prepared_moe_backend
         self.enable_dbo = enable_dbo
 
         # When both gates are present and FSE is enabled, fuse their
@@ -599,21 +604,43 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
         else:
-            # Modular kernels: select experts first, then call routed_experts
-            topk_weights, topk_ids = self.router.select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                topk_indices_dtype=self._quant_method.topk_indices_dtype,
-                input_ids=input_ids,
+            prepared_backend = self.prepared_moe_backend
+            can_prepare = (
+                prepared_backend is not None and self.router.eplb_state is None
             )
-
-            fused_out = self.routed_experts.forward_modular(
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                shared_experts=self._shared_experts,
-                shared_experts_input=shared_experts_input,
+            prepared = (
+                prepared_backend.prepare(
+                    hidden_states,
+                    router_logits,
+                    input_ids,
+                    self.router,
+                    self.routed_experts,
+                )
+                if can_prepare
+                else None
             )
+            if prepared is not None:
+                assert prepared_backend is not None
+                fused_out = prepared_backend.consume(
+                    hidden_states,
+                    self.routed_experts,
+                    prepared,
+                )
+            else:
+                # Modular kernels: select experts first, then call routed_experts.
+                topk_weights, topk_ids = self.router.select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    topk_indices_dtype=self._quant_method.topk_indices_dtype,
+                    input_ids=input_ids,
+                )
+                fused_out = self.routed_experts.forward_modular(
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=self._shared_experts,
+                    shared_experts_input=shared_experts_input,
+                )
 
         self._maybe_apply_shared_experts(
             shared_experts_input,
