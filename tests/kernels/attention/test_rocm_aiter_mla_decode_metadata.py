@@ -69,6 +69,120 @@ _OUTPUT_ARG_FIELDS = (
 )
 
 
+@pytest.mark.parametrize(
+    ("num_heads", "max_qo_len", "num_reqs", "expected"),
+    [
+        (12, 1, 1, True),
+        (12, 1, 128, False),
+        (12, 2, 1, False),
+        (16, 1, 1, False),
+    ],
+)
+def test_gluon_decode_selection_respects_batch_one_contract(
+    num_heads: int,
+    max_qo_len: int,
+    num_reqs: int,
+    expected: bool,
+):
+    """Never route a multi-request graph-profile batch to bh16bn128."""
+    from vllm.v1.attention.backends.mla.rocm_aiter_mla import AiterMLAHelper
+
+    assert AiterMLAHelper.use_gluon_decode(num_heads, max_qo_len, num_reqs) is expected
+
+
+@pytest.mark.parametrize("num_heads", [8, 12, 16])
+def test_small_head_padding_preserves_real_head_prefix(num_heads: int):
+    """Pad arbitrary small-head counts to 16 and recover the real prefix."""
+    from vllm.v1.attention.backends.mla.rocm_aiter_mla import AiterMLAHelper
+
+    query = torch.arange(2 * num_heads * 4).reshape(2, num_heads, 4)
+    padded = AiterMLAHelper.get_mla_padded_q(num_heads, query)
+
+    assert padded.shape == (2, max(16, num_heads), 4)
+    assert padded.is_contiguous()
+    assert torch.equal(padded[:, :num_heads, :], query)
+    assert torch.equal(AiterMLAHelper.get_mla_unpadded_o(num_heads, padded), query)
+
+
+def test_gluon_query_boundary_dequantizes_fp8_once():
+    """Gluon receives BF16 Q while preserving the FP8 query's real scale."""
+    from vllm.v1.attention.backends.mla.rocm_aiter_mla import AiterMLAHelper
+
+    fp8_q = torch.tensor([[[2.0, -4.0, 6.0, -8.0]]], dtype=torch.float8_e4m3fn)
+    q_nope, q_pe = AiterMLAHelper.get_gluon_q_parts(
+        fp8_q,
+        kv_lora_rank=2,
+        qk_rope_head_dim=2,
+        q_scale=0.5,
+    )
+
+    assert q_nope.dtype == torch.bfloat16
+    assert q_pe.dtype == torch.bfloat16
+    torch.testing.assert_close(q_nope.float(), torch.tensor([[[1.0, -2.0]]]))
+    torch.testing.assert_close(q_pe.float(), torch.tensor([[[3.0, -4.0]]]))
+
+
+@pytest.mark.parametrize(
+    ("use_gluon_decode", "expected"),
+    [(True, False), (False, True)],
+)
+def test_query_quantization_follows_decode_kernel_contract(
+    use_gluon_decode: bool,
+    expected: bool,
+):
+    """Only AITER kernels that consume FP8 Q request upstream quantization."""
+    from vllm.v1.attention.backends.mla import rocm_aiter_mla
+
+    impl = object.__new__(rocm_aiter_mla.AiterMLAImpl)
+    impl.supports_quant_query_input = True
+    metadata = types.SimpleNamespace(
+        decode=types.SimpleNamespace(use_gluon_decode=use_gluon_decode)
+    )
+
+    assert impl.should_quantize_mqa_query(metadata) is expected
+
+
+def test_gluon_graph_decode_forwards_fixed_split_schedule():
+    """Graph replay must not collapse small-head MLA decode to one KV split."""
+    from vllm.v1.attention.backends.mla import rocm_aiter_mla
+
+    impl = object.__new__(rocm_aiter_mla.AiterMLAImpl)
+    impl.kv_lora_rank = 2
+    impl.qk_rope_head_dim = 2
+    impl.scale = 0.5
+
+    q_nope = torch.zeros((1, 12, 2), dtype=torch.bfloat16)
+    q_pe = torch.zeros((1, 12, 2), dtype=torch.bfloat16)
+    kv_cache = torch.zeros((8, 4), dtype=torch.bfloat16)
+    decode = types.SimpleNamespace(
+        use_gluon_decode=True,
+        max_qo_len=1,
+        attn_out_dtype=torch.bfloat16,
+        paged_kv_indices=torch.arange(8, dtype=torch.int32),
+        paged_kv_indptr=torch.tensor([0, 8], dtype=torch.int32),
+        min_kv_seq_len=1,
+    )
+    metadata = types.SimpleNamespace(decode=decode)
+    layer = types.SimpleNamespace(_q_scale_float=1.0, _k_scale_float=1.0)
+    captured: dict = {}
+
+    def fake_mla_gluon(**kwargs):
+        captured.update(kwargs)
+        return kwargs["o"], None
+
+    with patch.object(rocm_aiter_mla, "_get_mla_gluon", return_value=fake_mla_gluon):
+        output, lse = impl.forward_mqa(
+            (q_nope, q_pe),
+            kv_cache,
+            metadata,
+            layer,
+        )
+
+    assert output.shape == (1, 12, 2)
+    assert lse is None
+    assert captured["num_kv_splits"] == 32
+
+
 def _build_decode_metadata():
     """Build AITER MLA decode metadata for the fp8/fp8 nhead=32 fold path.
 
