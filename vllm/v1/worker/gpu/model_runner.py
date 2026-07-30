@@ -449,8 +449,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 ) + spec.num_speculative_blocks
             max_num_blocks_per_group.append(max_num_blocks)
 
+        draft_only_attn_layers = (
+            self.speculator.draft_attn_layer_names
+            if isinstance(self.speculator, DraftModelSpeculator)
+            else None
+        )
         self.attn_groups, attn_cg_support, self.kernel_block_sizes = init_attn_backend(
-            self.kv_cache_config, self.vllm_config, self.device
+            self.kv_cache_config,
+            self.vllm_config,
+            self.device,
+            cg_support_exclude_layers=draft_only_attn_layers,
         )
         self.block_tables = BlockTables(
             block_sizes=block_sizes,
@@ -1280,10 +1288,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 slot_mappings,
                 self.attn_groups,
                 self.kv_cache_config,
-                # FULL replay reads capture-time metadata buffers. Re-stage them
-                # from the zeroed dummy block tables instead of retaining state
-                # indices from the previous real batch.
-                for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
             )
 
         input_ids = input_batch.input_ids

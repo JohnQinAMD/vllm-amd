@@ -127,6 +127,28 @@ def _register_group(group: "GroupCoordinator") -> None:
     _groups[group.unique_name] = weakref.ref(group)
 
 
+def _apply_to_device_comms(
+    action: Callable[[DeviceCommunicatorBase], None],
+) -> None:
+    """Apply ``action`` to every group's device communicator.
+
+    Walks the registered parallel groups and skips those without a device
+    communicator (absent at ``world_size == 1``).
+    """
+    comms = []
+    for group_ref in _groups.values():
+        group = group_ref()
+        if group is None:
+            continue
+        dc = group.device_communicator
+        if dc is None:
+            continue
+        comms.append(dc)
+
+    for dc in comms:
+        action(dc)
+
+
 def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
@@ -137,6 +159,26 @@ def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
 
 def all_reduce_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     return torch.empty_like(tensor)
+
+
+def all_reduce_dual(
+    left: torch.Tensor,
+    right: torch.Tensor,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._all_reduce_dual_out_place(left, right)
+
+
+def all_reduce_dual_fake(
+    left: torch.Tensor,
+    right: torch.Tensor,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(left), torch.empty_like(right)
 
 
 def reduce_scatter(
@@ -331,6 +373,12 @@ direct_register_custom_op(
     op_name="all_reduce",
     op_func=all_reduce,
     fake_impl=all_reduce_fake,
+)
+
+direct_register_custom_op(
+    op_name="all_reduce_dual",
+    op_func=all_reduce_dual,
+    fake_impl=all_reduce_dual_fake,
 )
 
 direct_register_custom_op(
@@ -663,6 +711,32 @@ class GroupCoordinator:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_reduce(input_)
+
+    def all_reduce_dual(
+        self,
+        left: torch.Tensor,
+        right: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """All-reduce two tensors through one communicator operation."""
+        if self.world_size == 1:
+            return left, right
+
+        if self.use_custom_op_call:
+            return torch.ops.vllm.all_reduce_dual(
+                left,
+                right,
+                group_name=self.unique_name,
+            )
+        return self._all_reduce_dual_out_place(left, right)
+
+    def _all_reduce_dual_out_place(
+        self,
+        left: torch.Tensor,
+        right: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.all_reduce_dual(left, right)
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
@@ -2026,6 +2100,20 @@ def prepare_communication_buffer_for_model(model: torch.nn.Module):
         _EP.prepare_communication_buffer_for_model(model)
     if _EPLB is not None:
         _EPLB.prepare_communication_buffer_for_model(model)
+
+
+def checkpoint_prepare_distributed_state() -> None:
+    """Prepare every device communicator for a process checkpoint."""
+    torch.accelerator.synchronize()
+    _apply_to_device_comms(lambda comm: comm.checkpoint_prepare())
+    torch.accelerator.synchronize()
+
+
+def checkpoint_restore_distributed_state() -> None:
+    """Restore every device communicator after a process checkpoint."""
+    torch.accelerator.synchronize()
+    _apply_to_device_comms(lambda comm: comm.checkpoint_restore())
+    torch.accelerator.synchronize()
 
 
 def model_parallel_is_initialized():

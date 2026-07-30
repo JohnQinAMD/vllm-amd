@@ -338,6 +338,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
             torch.distributed.all_reduce(out, group=self.device_group)
         return out
 
+    def all_reduce_dual(
+        self,
+        left: torch.Tensor,
+        right: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        aiter_ar_comm = self.aiter_ar_comm
+        if aiter_ar_comm is not None:
+            output = aiter_ar_comm.custom_all_reduce_dual(left, right)
+            if output is not None:
+                return output
+        return super().all_reduce_dual(left, right)
+
     def custom_all_gather(self, input_: torch.Tensor) -> torch.Tensor | None:
         ca_comm = self.ca_comm
         if ca_comm is None:
@@ -582,6 +594,22 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.all2all_manager is not None:
             self.all2all_manager.destroy()
             self.all2all_manager = None  # type: ignore[assignment]
+
+    def checkpoint_prepare(self) -> None:
+        # Only FlashInfer all-reduce and FlashInfer all2all are supported for now.
+        from .flashinfer_all_reduce import checkpoint_prepare_fi_ar_workspaces
+
+        checkpoint_prepare_fi_ar_workspaces(self.cpu_group)
+        if self.all2all_manager is not None:
+            self.all2all_manager.checkpoint_prepare()
+
+    def checkpoint_restore(self) -> None:
+        # Only FlashInfer all-reduce and FlashInfer all2all are supported for now.
+        from .flashinfer_all_reduce import checkpoint_restore_fi_ar_workspaces
+
+        checkpoint_restore_fi_ar_workspaces(self.cpu_group)
+        if self.all2all_manager is not None:
+            self.all2all_manager.checkpoint_restore()
 
     def all_gatherv(
         self,

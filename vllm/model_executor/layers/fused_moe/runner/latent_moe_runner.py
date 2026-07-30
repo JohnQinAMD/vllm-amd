@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from typing import Protocol
+
 import torch
 
 import vllm.envs as envs
 from vllm.config import get_current_vllm_config
 from vllm.distributed import tensor_model_parallel_all_reduce
-from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_allreduce_gemma_rms_norm import (
     _AR_RESIDUAL_RMS_NORM,
     _can_use_flashinfer,
@@ -16,7 +17,33 @@ from vllm.utils.torch_utils import aux_stream, current_stream
 
 from .moe_runner import MoERunner, _unpack
 
-logger = init_logger(__name__)
+
+class LatentMoETailContract(Protocol):
+    max_num_tokens: int
+
+
+class LatentMoETailOp(Protocol):
+    contract: LatentMoETailContract
+
+    def __call__(
+        self,
+        routed_output: torch.Tensor,
+        shared_output: torch.Tensor,
+        rms_weight: torch.Tensor,
+        up_weight: torch.Tensor,
+    ) -> torch.Tensor: ...
+
+
+class LatentMoETailOpFactory(Protocol):
+    def __call__(
+        self,
+        *,
+        hidden_size: int,
+        latent_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        rms_eps: float,
+    ) -> LatentMoETailOp: ...
 
 
 class LatentMoERunner(MoERunner):
@@ -37,25 +64,13 @@ class LatentMoERunner(MoERunner):
     def __init__(
         self,
         *args,
-        enable_k3_latent_moe_tail_fusion: bool = False,
+        latent_moe_tail_op_factory: LatentMoETailOpFactory | None = None,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
-        self.enable_k3_latent_moe_tail_fusion = enable_k3_latent_moe_tail_fusion
+        self._latent_moe_tail_op: LatentMoETailOp | None = None
         use_fused_path = self._use_fused_path()
-        if (
-            self.enable_k3_latent_moe_tail_fusion
-            and use_fused_path
-            and self.moe_config.tp_size not in (8, 16)
-        ):
-            logger.warning_once(
-                "K3 latent-MoE tail fusion currently supports TP=8 and TP=16, "
-                "but TP=%d is configured. Falling back to the default path.",
-                self.moe_config.tp_size,
-            )
-            self.enable_k3_latent_moe_tail_fusion = False
-
-        if self.enable_k3_latent_moe_tail_fusion and use_fused_path:
+        if latent_moe_tail_op_factory is not None and use_fused_path:
             vllm_config = get_current_vllm_config()
             if vllm_config.parallel_config.use_ubatching:
                 raise ValueError(
@@ -69,18 +84,13 @@ class LatentMoERunner(MoERunner):
             assert transform is not None
             norm = transform.norm
             assert norm is not None
-            from vllm.models.kimi_k3.nvidia.ops.latent_moe_tail import (
-                KimiK3LatentMoETailOp,
-            )
-
-            op = KimiK3LatentMoETailOp.initialize(
+            self._latent_moe_tail_op = latent_moe_tail_op_factory(
                 hidden_size=transform.up_proj.weight.shape[0],
                 latent_size=norm.weight.shape[0],
                 dtype=norm.weight.dtype,
                 device=norm.weight.device,
                 rms_eps=norm.variance_epsilon,
             )
-            self._k3_latent_moe_tail_op = op
 
     def _get_zero_residual(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Read-only zero ``residual_in`` for the fused AR+RMSNorm kernel.
@@ -170,8 +180,8 @@ class LatentMoERunner(MoERunner):
         transform = self.routed_output_transform
         assert transform is not None
 
-        if self.enable_k3_latent_moe_tail_fusion:
-            op = self._k3_latent_moe_tail_op
+        if self._latent_moe_tail_op is not None:
+            op = self._latent_moe_tail_op
             if 0 < fused_output.shape[0] <= op.contract.max_num_tokens:
                 norm = transform.norm
                 assert norm is not None

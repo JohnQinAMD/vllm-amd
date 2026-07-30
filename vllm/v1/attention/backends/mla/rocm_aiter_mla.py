@@ -134,6 +134,13 @@ class AiterMLADecodeMetadata(MLACommonDecodeMetadata):
     use_gluon_decode: bool = False
     # Whether persistent MLA metadata was computed (only for qseqlen=1)
     has_persistent_metadata: bool = False
+    # Flattened per-verify-token paged-KV metadata for the <16-head gluon
+    # multi-token (spec-decode verify) path. Built once per step in
+    # _build_decode into persistent buffers so forward_mqa needs no host sync
+    # and no data-dependent allocation (CUDA-graph safe). None when the step is
+    # not a <16-head qseqlen>1 decode.
+    flat_kv_indptr: torch.Tensor | None = None
+    flat_kv_indices: torch.Tensor | None = None
 
 
 @dataclass
@@ -215,6 +222,35 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         self.paged_kv_indices = torch.zeros(
             max_num_pages, dtype=torch.int32, device=device
         )
+
+        # Spec-decode verify with num_heads < 16: mla_gluon takes one query row
+        # per token, so the per-request page table must be replicated per verify
+        # token. Do it once per step in _build_decode into persistent buffers.
+        _qo_threshold = getattr(self, "reorder_batch_threshold", 1) or 1
+        self.max_flat_qo_len = (
+            int(_qo_threshold)
+            if (
+                _qo_threshold > 1
+                and self.num_heads < AiterMLAHelper._AITER_MIN_MLA_HEADS
+            )
+            else 0
+        )
+        self.flat_kv_indptr: torch.Tensor | None = None
+        self.flat_kv_indices: torch.Tensor | None = None
+        if self.max_flat_qo_len:
+            _flat_rows = max_num_reqs * self.max_flat_qo_len
+            self.flat_kv_indptr = torch.zeros(
+                _flat_rows + 1, dtype=torch.int32, device=device
+            )
+            self.flat_kv_indices = torch.zeros(
+                _flat_rows * max_num_pages_per_req, dtype=torch.int32, device=device
+            )
+        # Graph-constant split hint for the flattened gluon call. mla_gluon picks
+        # NUM_KV_SPLITS on the HOST from min_kv_seq_len, so it must not depend on
+        # live data. A large constant yields NUM_KV_SPLITS = 256 // batch_size
+        # (max parallelism); the kernel handles seq_len < splits via its
+        # kv_len_per_split == 0 branch, so this is a perf knob, not correctness.
+        self.flat_gluon_min_kv_seq_len = 1 << 20
 
         from aiter import dtypes, get_mla_metadata_info_v1
 
@@ -525,6 +561,51 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         )
         paged_kv_indices = self.paged_kv_indices
 
+        # Spec-decode verify (<16 heads): build the flattened, CAUSAL per-token
+        # paged-KV metadata here (never in forward_mqa). Row (r, t) attends the
+        # committed prefix plus verify tokens 0..t, i.e.
+        #   seq_lens[r] - (qlen - 1 - t)
+        # entries. seq_lens already includes the whole query block
+        # (input_batch.py: seq_len = num_computed_tokens + query_len), so the
+        # previous "repeat the full range for every row" flatten let every verify
+        # token attend the *unverified* draft tokens that follow it.
+        flat_kv_indptr = None
+        flat_kv_indices = None
+        if self.max_flat_qo_len and int(max_qo_len) > 1:
+            qlen = int(max_qo_len)
+            assert qlen <= self.max_flat_qo_len
+            # QueryLenSupport.UNIFORM guarantees a uniform decode block; the
+            # flatten's row layout (r*qlen+t) assumes it. CPU tensor -> no sync.
+            assert bool((qo_len == qlen).all()), (
+                "AiterMLA flattened verify requires a uniform decode query len"
+            )
+            rows = num_reqs * qlen
+            step = torch.arange(qlen, device=device, dtype=torch.int32)
+            row_seq_lens = (
+                seq_lens_device.to(torch.int32).repeat_interleave(qlen)
+                - (qlen - 1)
+                + step.repeat(num_reqs)
+            ).clamp_(min=0)
+            row_indptr = torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.int32, device=device),
+                    row_seq_lens.cumsum(0, dtype=torch.int32),
+                ]
+            )
+            self.flat_kv_indptr[: rows + 1].copy_(row_indptr, non_blocking=True)
+            _expand_page_indices_flat_kernel[(rows,)](
+                self.flat_kv_indices,
+                block_table_tensor,
+                block_table_tensor.stride(0),
+                self.flat_kv_indptr,
+                row_seq_lens,
+                QO_LEN=qlen,
+                KERNEL_BLOCK_SIZE=self.kernel_block_size,
+                BLOCK_SIZE=1024,
+            )
+            flat_kv_indptr = self.flat_kv_indptr[: rows + 1]
+            flat_kv_indices = self.flat_kv_indices
+
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.paged_kv_indptr[: 1 + num_reqs].copy_(
                 paged_kv_indptr, non_blocking=True
@@ -592,6 +673,9 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             use_gluon_decode=use_gluon_decode,
             attn_out_dtype=self.decode_attn_out_dtype,
             has_persistent_metadata=has_persistent_metadata,
+            flat_kv_indptr=flat_kv_indptr,
+            flat_kv_indices=flat_kv_indices,
+            min_kv_seq_len=self.flat_gluon_min_kv_seq_len,
         )
 
         return attn_metadata
@@ -618,6 +702,37 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         if self._fp8_prefill_enabled and attn_metadata.prefill is not None:
             self._build_fp8_prefill_ps_metadata(attn_metadata, common_attn_metadata)
         return attn_metadata
+
+
+@triton.jit
+def _expand_page_indices_flat_kernel(
+    page_indices,
+    block_table,
+    block_table_stride,
+    cu_num_tokens,
+    seq_lens,
+    QO_LEN: tl.constexpr,
+    KERNEL_BLOCK_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Same as _expand_page_indices_kernel, but one program per (request,
+    verify-token) row: row r*QO_LEN+t reads request r's block table and writes
+    seq_lens[row] flat page indices at cu_num_tokens[row]."""
+    row_idx = tl.program_id(0)
+    req_idx = row_idx // QO_LEN
+    row_ptr = block_table + req_idx * block_table_stride
+    start_idx = tl.load(cu_num_tokens + row_idx)
+    num_tokens = tl.load(seq_lens + row_idx)
+
+    offset = tl.arange(0, BLOCK_SIZE)
+    for i in tl.range(0, num_tokens, BLOCK_SIZE):
+        token_offsets = i + offset
+        mask = token_offsets < num_tokens
+        block_idx = token_offsets // KERNEL_BLOCK_SIZE
+        offset_in_block = token_offsets % KERNEL_BLOCK_SIZE
+        block_ids = tl.load(row_ptr + block_idx, mask=mask)
+        flat_indices = block_ids * KERNEL_BLOCK_SIZE + offset_in_block
+        tl.store(page_indices + start_idx + token_offsets, flat_indices, mask=mask)
 
 
 @triton.jit
@@ -1021,25 +1136,13 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                 device=q_nope.device,
             )
             kv_buffer = kv_c_and_k_pe_cache.reshape(-1, kv_c_and_k_pe_cache.shape[-1])
-            # Expand per-request paged-KV to per-verify-token: each request's KV
-            # block is repeated qlen times (row r*qlen+t attends request r's
-            # committed prefix). Fully vectorized (no host loop).
-            old_indptr = decode.paged_kv_indptr
-            per_req_len = old_indptr[1:] - old_indptr[:-1]
-            dev = q_nope.device
-            row_req = torch.arange(
-                per_req_len.shape[0], device=dev
-            ).repeat_interleave(qlen)
-            row_len = per_req_len[row_req]
-            new_indptr = torch.cat(
-                [old_indptr.new_zeros(1), row_len.cumsum(0)]
-            ).to(torch.int32)
-            total = int(new_indptr[-1].item())
-            within = torch.arange(
-                total, device=dev, dtype=torch.int64
-            ) - new_indptr[:-1].to(torch.int64).repeat_interleave(row_len)
-            src = old_indptr[row_req].to(torch.int64).repeat_interleave(row_len) + within
-            new_indices = decode.paged_kv_indices[src]
+            # Per-verify-token paged-KV metadata is prebuilt in _build_decode
+            # (causal row lengths, persistent buffers, no host sync) so this
+            # branch is CUDA-graph capturable.
+            assert decode.flat_kv_indptr is not None
+            assert decode.flat_kv_indices is not None
+            new_indptr = decode.flat_kv_indptr
+            new_indices = decode.flat_kv_indices
             mla_gluon = _get_mla_gluon()
             mla_gluon(
                 q_nope=q_nope,
@@ -1053,7 +1156,7 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                 kv_pe_offset=self.kv_lora_rank,
                 use_2d_view=False,
                 kv_scale=1.0,
-                min_kv_seq_len=int(per_req_len.min()),
+                min_kv_seq_len=decode.min_kv_seq_len,
             )
             return o, None
 

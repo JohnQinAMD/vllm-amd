@@ -14,6 +14,14 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     return get_tp_group().all_reduce(input_)
 
 
+def tensor_model_parallel_all_reduce_dual(
+    left: torch.Tensor,
+    right: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """All-reduce two tensors across the model-parallel group."""
+    return get_tp_group().all_reduce_dual(left, right)
+
+
 def tensor_model_parallel_all_gather(
     input_: torch.Tensor, dim: int = -1
 ) -> torch.Tensor:

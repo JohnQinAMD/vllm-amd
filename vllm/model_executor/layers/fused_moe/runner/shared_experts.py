@@ -52,6 +52,7 @@ class SharedExperts(torch.nn.Module):
         # index is always 0 and the second output list element is ignored.
         self.enable_dbo = enable_dbo
         self._output: list[torch.Tensor | None] = [None, None]
+        self._output_is_precomputed = [False, False]
         self._layer = layer
         self._moe_config = moe_config
 
@@ -112,6 +113,8 @@ class SharedExperts(torch.nn.Module):
         self,
         shared_experts_input: torch.Tensor,
     ):
+        if self._output_is_precomputed[self._output_idx]:
+            return
         experts_order = self._determine_shared_experts_order(shared_experts_input)
 
         if experts_order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
@@ -150,13 +153,33 @@ class SharedExperts(torch.nn.Module):
         assert self._output[self._output_idx] is not None
         output = self._output[self._output_idx]
         self._output[self._output_idx] = None
+        self._output_is_precomputed[self._output_idx] = False
         return output
+
+    def set_precomputed_output(self, output: torch.Tensor) -> None:
+        """Provide the shared result when a caller owns its fused prologue."""
+
+        output_idx = self._output_idx
+        if self._output[output_idx] is not None:
+            raise RuntimeError("shared expert output slot is already occupied")
+        self._output[output_idx] = output
+        self._output_is_precomputed[output_idx] = True
+
+    def clear_precomputed_output(self) -> None:
+        """Clear a precomputed slot after a downstream execution failure."""
+
+        output_idx = self._output_idx
+        if self._output_is_precomputed[output_idx]:
+            self._output[output_idx] = None
+            self._output_is_precomputed[output_idx] = False
 
     def forward(
         self,
         shared_experts_input: torch.Tensor,
         order: SharedExpertsOrder,
     ):
+        if self._output_is_precomputed[self._output_idx]:
+            return None
         experts_order = self._determine_shared_experts_order(shared_experts_input)
 
         if order != experts_order:

@@ -56,6 +56,17 @@ class AiterCustomAllreduce:
     def custom_all_reduce(self, inp: torch.Tensor) -> torch.Tensor | None:
         return self._impl.custom_all_reduce(inp)
 
+    def custom_all_reduce_dual(
+        self,
+        left: torch.Tensor,
+        right: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Use AITER's optional dual-input graph kernel when available."""
+        implementation = getattr(self._impl, "custom_all_reduce_dual", None)
+        if implementation is None:
+            return None
+        return implementation(left, right)
+
     def capture(self):
         return self._impl.capture()
 

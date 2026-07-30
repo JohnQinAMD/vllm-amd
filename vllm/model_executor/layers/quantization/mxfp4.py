@@ -38,6 +38,9 @@ from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
 logger = init_logger(__name__)
 
+_KIMI_K3_W13_SEPARATED = "gate_up_separated_preshuffled"
+_KIMI_K3_W13_INTERLEAVED = "gate_up_interleaved_preshuffled"
+
 
 class Mxfp4Config(QuantizationConfig):
     """Canonical base config for MXFP4 quantization.
@@ -527,6 +530,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         self._cache_permute_indices: dict[torch.Size, torch.Tensor] = {}
         self.moe_kernel: mk.FusedMoEKernel | None = None
+        self.kimi_k3_w13_layout: str | None = None
+        self.kimi_k3_weights_shuffled = False
 
         # Used for triton kernel precision configs
         self.w13_precision_config = None
@@ -804,6 +809,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         replace_parameter(layer, "w2_weight_scale", w2_scale)
         layer.w13_weight.is_shuffled = True
         layer.w2_weight.is_shuffled = True
+        self.kimi_k3_w13_layout = (
+            _KIMI_K3_W13_INTERLEAVED if guinterleave else _KIMI_K3_W13_SEPARATED
+        )
+        self.kimi_k3_weights_shuffled = True
 
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         if self.moe_quant_config is not None and self.experts_cls is not None:
