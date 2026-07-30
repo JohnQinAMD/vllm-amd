@@ -235,7 +235,11 @@ ARG AITER_REPO
 ARG USE_SCCACHE
 RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
     pip install /install/*.whl
-RUN git clone --recursive --branch ${AITER_BRANCH} ${AITER_REPO}
+# Clone into an explicit 'aiter' dir: the following steps hard-code `cd aiter`,
+# but the default clone dir is derived from the repo NAME, so any AITER_REPO
+# override whose repo is not literally named 'aiter' (e.g. a fork called
+# aiter-amd) lands in the wrong directory and fails with `cd: aiter`.
+RUN git clone --recursive --branch ${AITER_BRANCH} ${AITER_REPO} aiter
 RUN cd aiter \
     && git submodule update --init --recursive \
     && pip install -r requirements.txt
