@@ -866,7 +866,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 # Convert from (N, B, L) to (B, N, L)
                 mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
 
-            if fp8_attention and self.impl.supports_quant_query_input:
+            if fp8_attention and self.impl.should_quantize_mqa_query(attn_metadata):
                 assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
                 assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
                 mqa_q = self._decode_concat_quant_fp8_op(
@@ -2201,6 +2201,15 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
         self.qk_head_dim = qk_head_dim
         self.v_head_dim = v_head_dim
         self.kv_b_proj = kv_b_proj
+
+    def should_quantize_mqa_query(self, attn_metadata: A) -> bool:
+        """Return whether decode should receive a pre-quantized FP8 query.
+
+        Most backends use one query contract for every decode kernel. Backends
+        with multiple decode kernels may override this hook when the selected
+        kernel's query dtype depends on runtime metadata.
+        """
+        return self.supports_quant_query_input
 
     def _concat_k_nope_k_pe(
         self, k_nope: torch.Tensor, k_pe: torch.Tensor

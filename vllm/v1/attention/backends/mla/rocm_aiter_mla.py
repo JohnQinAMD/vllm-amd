@@ -30,6 +30,10 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 
+# Full-graph decode cannot specialize on a runtime KV length. Keep one schedule
+# across replays; AITER handles empty splits for short sequences.
+_GLUON_DECODE_NUM_KV_SPLITS: Final = 32
+
 
 @functools.lru_cache(maxsize=1)
 def _get_mla_gluon():
@@ -503,7 +507,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         qo_len = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
         max_qo_len = qo_len.max().item()
         use_gluon_decode = AiterMLAHelper.use_gluon_decode(
-            self.num_heads, int(max_qo_len)
+            self.num_heads, int(max_qo_len), num_reqs
         )
 
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
@@ -701,25 +705,64 @@ class AiterMLAHelper:
 
     @staticmethod
     def get_mla_padded_q(num_heads: int, q: torch.Tensor) -> torch.Tensor:
-        return (
-            q
-            if num_heads >= AiterMLAHelper._AITER_MIN_MLA_HEADS
-            else q.repeat_interleave(
-                AiterMLAHelper._AITER_MIN_MLA_HEADS // num_heads, dim=1
-            )
-        )
+        if num_heads >= AiterMLAHelper._AITER_MIN_MLA_HEADS:
+            return q
+
+        # Keep the real heads as a contiguous prefix so arbitrary small-head
+        # counts work, not only divisors of 16. Extra heads are replicas and
+        # are discarded after the kernel.
+        repeat_factor = (
+            AiterMLAHelper._AITER_MIN_MLA_HEADS + num_heads - 1
+        ) // num_heads
+        return q.repeat(1, repeat_factor, 1)[
+            :, : AiterMLAHelper._AITER_MIN_MLA_HEADS, :
+        ].contiguous()
 
     @staticmethod
     def get_mla_unpadded_o(num_heads: int, o: torch.Tensor) -> torch.Tensor:
+        if num_heads >= AiterMLAHelper._AITER_MIN_MLA_HEADS:
+            return o
+        return o[:, :num_heads, :]
+
+    @staticmethod
+    def use_gluon_decode(num_heads: int, max_qo_len: int, num_reqs: int) -> bool:
+        """Select the small-head Gluon kernel only for its supported shape.
+
+        The FP8 ``bh16bn128`` regime is specialized for batch size one. This
+        guard is also needed during graph-memory profiling, which executes a
+        dummy batch at ``max_num_seqs`` before the endpoint starts.
+        """
         return (
-            o
-            if num_heads >= AiterMLAHelper._AITER_MIN_MLA_HEADS
-            else o[:, :: AiterMLAHelper._AITER_MIN_MLA_HEADS // num_heads, :]
+            num_heads < AiterMLAHelper._AITER_MIN_MLA_HEADS
+            and max_qo_len == 1
+            and num_reqs == 1
         )
 
     @staticmethod
-    def use_gluon_decode(num_heads: int, max_qo_len: int) -> bool:
-        return num_heads < AiterMLAHelper._AITER_MIN_MLA_HEADS and max_qo_len == 1
+    def get_gluon_q_parts(
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        q_scale: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the BF16 query components required by Gluon MLA.
+
+        FP8 KV-cache decode quantizes the concatenated query upstream for the
+        AITER ASM path. Gluon instead consumes BF16 Q with FP8 KV, so undo that
+        per-tensor query quantization before splitting NoPE and RoPE.
+        """
+        if type(q) is tuple:
+            q_nope, q_pe = q
+        else:
+            if q.dtype != torch.bfloat16:
+                q = q.to(torch.bfloat16).mul(q_scale)
+            q_nope, q_pe = torch.split(q, [kv_lora_rank, qk_rope_head_dim], dim=-1)
+
+        if q_nope.dtype != torch.bfloat16:
+            q_nope = q_nope.to(torch.bfloat16).mul(q_scale)
+        if q_pe.dtype != torch.bfloat16:
+            q_pe = q_pe.to(torch.bfloat16).mul(q_scale)
+        return q_nope, q_pe
 
 
 class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
@@ -775,6 +818,13 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
 
             self._mla_prefill_ps_asm_fwd = mla_prefill_ps_asm_fwd
             self._mla_reduce_v1 = mla_reduce_v1
+
+    def should_quantize_mqa_query(self, attn_metadata: AiterMLAMetadata) -> bool:
+        """Keep BF16 Q when metadata selects the mixed-dtype Gluon kernel."""
+        decode = attn_metadata.decode
+        return self.supports_quant_query_input and (
+            decode is None or not decode.use_gluon_decode
+        )
 
     def _flash_attn_varlen_diff_headdims(
         self, q, k, v, return_softmax_lse=False, softmax_scale=None, **kwargs
@@ -964,12 +1014,12 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
 
         decode = attn_metadata.decode
         if decode.use_gluon_decode:
-            if type(q) is tuple:
-                q_nope, q_pe = q
-            else:
-                q_nope, q_pe = torch.split(
-                    q, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-                )
+            q_nope, q_pe = AiterMLAHelper.get_gluon_q_parts(
+                q,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+                layer._q_scale_float,
+            )
             B, num_q_heads, _ = q_nope.shape
             o = torch.empty(
                 B,
@@ -991,8 +1041,9 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                 k_pe=None,
                 kv_pe_offset=self.kv_lora_rank,
                 use_2d_view=False,
-                kv_scale=1.0,
+                kv_scale=layer._k_scale_float,
                 min_kv_seq_len=decode.min_kv_seq_len,
+                num_kv_splits=_GLUON_DECODE_NUM_KV_SPLITS,
             )
             return o, None
 
@@ -1006,12 +1057,12 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             and int(decode.max_qo_len) > 1
         ):
             qlen = int(decode.max_qo_len)
-            if type(q) is tuple:
-                q_nope, q_pe = q
-            else:
-                q_nope, q_pe = torch.split(
-                    q, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-                )
+            q_nope, q_pe = AiterMLAHelper.get_gluon_q_parts(
+                q,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+                layer._q_scale_float,
+            )
             B, num_q_heads, _ = q_nope.shape
             o = torch.empty(
                 B,
@@ -1027,18 +1078,20 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             old_indptr = decode.paged_kv_indptr
             per_req_len = old_indptr[1:] - old_indptr[:-1]
             dev = q_nope.device
-            row_req = torch.arange(
-                per_req_len.shape[0], device=dev
-            ).repeat_interleave(qlen)
+            row_req = torch.arange(per_req_len.shape[0], device=dev).repeat_interleave(
+                qlen
+            )
             row_len = per_req_len[row_req]
-            new_indptr = torch.cat(
-                [old_indptr.new_zeros(1), row_len.cumsum(0)]
-            ).to(torch.int32)
+            new_indptr = torch.cat([old_indptr.new_zeros(1), row_len.cumsum(0)]).to(
+                torch.int32
+            )
             total = int(new_indptr[-1].item())
-            within = torch.arange(
-                total, device=dev, dtype=torch.int64
-            ) - new_indptr[:-1].to(torch.int64).repeat_interleave(row_len)
-            src = old_indptr[row_req].to(torch.int64).repeat_interleave(row_len) + within
+            within = torch.arange(total, device=dev, dtype=torch.int64) - new_indptr[
+                :-1
+            ].to(torch.int64).repeat_interleave(row_len)
+            src = (
+                old_indptr[row_req].to(torch.int64).repeat_interleave(row_len) + within
+            )
             new_indices = decode.paged_kv_indices[src]
             mla_gluon = _get_mla_gluon()
             mla_gluon(
@@ -1052,7 +1105,7 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                 k_pe=None,
                 kv_pe_offset=self.kv_lora_rank,
                 use_2d_view=False,
-                kv_scale=1.0,
+                kv_scale=layer._k_scale_float,
                 min_kv_seq_len=int(per_req_len.min()),
             )
             return o, None
