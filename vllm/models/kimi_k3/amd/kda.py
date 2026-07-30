@@ -21,6 +21,11 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
+from .ops.kda_input_projection import (
+    kda_input_projection,
+    prepack_kda_input_group64,
+)
+
 _HEADS = 12
 _DIM = 128
 _CONV_WIDTH = 4
@@ -242,6 +247,29 @@ def _pure_decode_request(
 class KimiGatedDeltaNetAttention(_KimiGatedDeltaNetAttention):
     """Kimi GDN layer with an AMD-only AITER pure-decode fast path."""
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.register_buffer("_kda_group64_weight", None, persistent=False)
+        self.register_buffer("_kda_group64_scale", None, persistent=False)
+
+    def finalize_kda_group64_weight(self) -> None:
+        """Prepack the projection only after all checkpoint shards load."""
+
+        weight = getattr(self.in_proj_qkvgfab, "weight", None)
+        if not isinstance(weight, torch.Tensor):
+            return
+        packed = prepack_kda_input_group64(weight)
+        if packed is not None:
+            self._kda_group64_weight, self._kda_group64_scale = packed
+
+    def _project_qkvgfab(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return kda_input_projection(
+            hidden_states,
+            super()._project_qkvgfab,
+            self._kda_group64_weight,
+            self._kda_group64_scale,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -249,7 +277,7 @@ class KimiGatedDeltaNetAttention(_KimiGatedDeltaNetAttention):
         output: torch.Tensor,
     ) -> None:
         num_tokens = hidden_states.size(0)
-        projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
+        projected_qkvgfab = self._project_qkvgfab(hidden_states)
         if self.use_full_rank_gate:
             split_sizes = [
                 3 * self.local_projection_size,

@@ -822,6 +822,13 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             return hidden_states, aux_hidden_states
         return hidden_states
 
+    def finalize_kda_group64_weights(self) -> None:
+        """Prepack every local KDA projection after checkpoint loading."""
+
+        for module in self.modules():
+            if isinstance(module, KimiGatedDeltaNetAttention):
+                module.finalize_kda_group64_weight()
+
     def load_weights(
         self,
         weights: Iterable[
@@ -1059,4 +1066,6 @@ class KimiLinearForCausalLM(
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
-        return loader.load_weights(weights)
+        loaded = loader.load_weights(weights)
+        self.model.finalize_kda_group64_weights()
+        return loaded
