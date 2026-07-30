@@ -69,6 +69,7 @@ from vllm.models.kimi_k3.amd.kda import KimiGatedDeltaNetAttention
 from vllm.models.kimi_k3.amd.ops.attn_res import attn_res
 from vllm.models.kimi_k3.amd.ops.latent_moe_tail import KimiK3LatentMoETailOp
 from vllm.models.kimi_k3.amd.ops.moe_gate import KimiK3AiterGateLinear
+from vllm.models.kimi_k3.amd.ops.mla_gate import kimi_k3_mla_output_gate
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.math_utils import cdiv
@@ -586,6 +587,7 @@ class KimiMLAAttention(nn.Module):
             is_sparse=False,
             topk_indices_buffer=None,
             g_proj=getattr(self, "g_proj", None),
+            output_gate=kimi_k3_mla_output_gate,
         )
         self.mla_attn = MultiHeadLatentAttentionWrapper(
             self.hidden_size,
