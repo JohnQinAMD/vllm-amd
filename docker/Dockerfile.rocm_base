@@ -1,5 +1,12 @@
 ARG BASE_IMAGE=rocm/dev-ubuntu-22.04:7.2.3-complete
-ARG TRITON_BRANCH="0f380657"
+# AITER's Gluon kernels (mla_gluon, gemm_a8w8_blockscale, fp8_mqa_logits, ...)
+# construct PaddedSharedLayout(..., cga_layout=...), which only exists in Triton
+# 3.7.x. The previous pin 0f380657 builds 3.6.0 and the server dies at engine
+# init with:
+#   TypeError: PaddedSharedLayout.__init__() got an unexpected keyword argument
+#              'cga_layout'
+# The measured internal image used triton 3.7.0+amd.rocm7.2.0.git89002410.
+ARG TRITON_BRANCH="furmanek/3.7.x-default-order"
 ARG TRITON_REPO="https://github.com/ROCm/triton.git"
 ARG PYTORCH_BRANCH="d0c8b1f3" # release/2.11 as of 6/09
 ARG PYTORCH_REPO="https://github.com/ROCm/pytorch.git"
