@@ -358,10 +358,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
             g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
 
-        g1 = self.f_b_proj(f_a)[0]
         beta = beta.unsqueeze(0)
-        g1 = rearrange(g1, "n (h d) -> 1 n h d", d=self.head_dim)
-
         g2 = rearrange(g_proj_states, "... (h d) -> ... h d", d=self.head_dim)
 
         core_attn_out = torch.empty(
@@ -370,15 +367,34 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             device=hidden_states.device,
         )
 
-        self._forward(
+        self._run_core(
+            f_a=f_a,
             mixed_qkv=mixed_qkv,
-            g1=g1,
-            g2=g2,
             beta=beta,
+            output_gate=g2,
             core_attn_out=core_attn_out,
         )
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
         output[:] = self.o_proj(core_attn_out)[0]
+
+    def _run_core(
+        self,
+        *,
+        f_a: torch.Tensor,
+        mixed_qkv: torch.Tensor,
+        beta: torch.Tensor,
+        output_gate: torch.Tensor,
+        core_attn_out: torch.Tensor,
+    ) -> None:
+        g1 = self.f_b_proj(f_a)[0]
+        g1 = rearrange(g1, "n (h d) -> 1 n h d", d=self.head_dim)
+        self._forward(
+            mixed_qkv=mixed_qkv,
+            g1=g1,
+            g2=output_gate,
+            beta=beta,
+            core_attn_out=core_attn_out,
+        )
 
     @eager_break_during_capture
     def _forward(
