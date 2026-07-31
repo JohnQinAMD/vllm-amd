@@ -76,6 +76,8 @@ from vllm.utils.math_utils import cdiv
 
 logger = init_logger(__name__)
 
+_LATENT_TAIL_FP8_WEIGHTS = 92
+
 
 class KimiMLP(nn.Module):
     def __init__(
@@ -401,6 +403,24 @@ class KimiMoE(nn.Module):
             self._preroute_shared_down_weight,
             self._preroute_shared_down_scale,
         ) = quantize_kimi_k3_preroute_weight(shared_down_weight)
+
+    def finalize_latent_tail_fp8_weight(self) -> None:
+        """Prepack the latent-tail up-projection before graph capture."""
+
+        if not envs.VLLM_ROCM_USE_KIMI_K3_LATENT_TAIL_FP8:
+            return
+        if (
+            not self.use_latent_moe
+            or self.tp_size != 8
+            or self.routed_expert_up_proj is None
+            or not envs.VLLM_ENABLE_K3_LATENT_MOE_TAIL_FUSION
+            or not rocm_aiter_ops.is_enabled()
+        ):
+            raise RuntimeError(
+                "Kimi-K3 FP8 latent tail requires latent MoE, TP=8, "
+                "the AITER latent-tail fusion, and AITER."
+            )
+        KimiK3LatentMoETailOp.prepack_up_weight(self.routed_expert_up_proj.weight)
 
     def _apply_preroute_fp8(
         self,
@@ -1134,6 +1154,31 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             if isinstance(module, KimiMoE):
                 module.finalize_preroute_fp8_weights()
 
+    def finalize_latent_tail_fp8_weights(self) -> None:
+        """Pack all expected latent-tail weights or fail model loading."""
+
+        if not envs.VLLM_ROCM_USE_KIMI_K3_LATENT_TAIL_FP8:
+            return
+        if get_tensor_model_parallel_world_size() != 8:
+            raise RuntimeError("Kimi-K3 FP8 latent tail requires TP=8")
+        modules = [
+            module
+            for module in self.modules()
+            if isinstance(module, KimiMoE) and module.use_latent_moe
+        ]
+        if len(modules) != _LATENT_TAIL_FP8_WEIGHTS:
+            raise RuntimeError(
+                "Kimi-K3 FP8 latent-tail weight count drift: "
+                f"{len(modules)} != {_LATENT_TAIL_FP8_WEIGHTS}"
+            )
+        for module in modules:
+            module.finalize_latent_tail_fp8_weight()
+        torch.cuda.synchronize()
+        logger.info(
+            "Packed %d Kimi-K3 FP8 latent-tail weights",
+            len(modules),
+        )
+
 
 class KimiLinearForCausalLM(nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -1232,4 +1277,5 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, SupportsPP, MixtureOfExper
         loaded = loader.load_weights(weights)
         self.model.finalize_preroute_fp8_weights()
         self.model.finalize_kda_group64_weights()
+        self.model.finalize_latent_tail_fp8_weights()
         return loaded
