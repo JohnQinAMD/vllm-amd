@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import weakref
 from dataclasses import dataclass
 from typing import ClassVar
 
 import torch
 
+import vllm.envs as envs
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce_dual,
@@ -35,6 +37,57 @@ class KimiK3LatentMoETailOp:
     _instances: ClassVar[
         dict[KimiK3LatentMoETailContract, "KimiK3LatentMoETailOp"]
     ] = {}
+    _packed_up_weights: ClassVar[
+        dict[
+            tuple[torch.device, int],
+            tuple[
+                weakref.ReferenceType[torch.Tensor],
+                torch.Tensor,
+                torch.Tensor,
+            ],
+        ]
+    ] = {}
+
+    @classmethod
+    @torch.no_grad()
+    def prepack_up_weight(cls, up_weight: torch.Tensor) -> None:
+        """Build the FP8 representation after loading, before graph capture."""
+
+        if not envs.VLLM_ROCM_USE_KIMI_K3_LATENT_TAIL_FP8:
+            return
+        if (
+            not up_weight.is_cuda
+            or up_weight.dtype != torch.bfloat16
+            or tuple(up_weight.shape) != (_HIDDEN_SIZE, _LATENT_SIZE)
+            or not up_weight.is_contiguous()
+        ):
+            raise RuntimeError(
+                "Kimi-K3 FP8 latent tail requires a contiguous CUDA BF16 "
+                "up-projection with shape [7168,3584]"
+            )
+        key = (up_weight.device, up_weight.data_ptr())
+        existing = cls._packed_up_weights.get(key)
+        if existing is not None and existing[0]() is up_weight:
+            return
+
+        from aiter.ops.flydsl.latent_moe_tail_fp8 import (
+            quantize_latent_moe_tail_weight,
+        )
+
+        packed, scale = quantize_latent_moe_tail_weight(up_weight)
+
+        def remove_stale(
+            reference: weakref.ReferenceType[torch.Tensor],
+        ) -> None:
+            current = cls._packed_up_weights.get(key)
+            if current is not None and current[0] is reference:
+                cls._packed_up_weights.pop(key, None)
+
+        cls._packed_up_weights[key] = (
+            weakref.ref(up_weight, remove_stale),
+            packed,
+            scale,
+        )
 
     @classmethod
     def initialize(
@@ -102,6 +155,27 @@ class KimiK3LatentMoETailOp:
             routed_output,
             shared_output,
         )
+
+        if envs.VLLM_ROCM_USE_KIMI_K3_LATENT_TAIL_FP8:
+            key = (up_weight.device, up_weight.data_ptr())
+            packed = self._packed_up_weights.get(key)
+            if packed is None or packed[0]() is not up_weight:
+                raise RuntimeError(
+                    "Kimi-K3 FP8 latent-tail weight was not prepacked before "
+                    "decode; refusing graph-capture-time allocation"
+                )
+            from aiter.ops.flydsl.latent_moe_tail_fp8 import (
+                latent_moe_tail_fp8,
+            )
+
+            return latent_moe_tail_fp8(
+                routed_reduced,
+                shared_reduced,
+                rms_weight,
+                packed[1],
+                packed[2],
+                self.contract.rms_eps,
+            )
 
         from aiter.ops.flydsl.latent_moe_tail import latent_moe_tail
 

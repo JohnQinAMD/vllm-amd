@@ -271,6 +271,7 @@ if TYPE_CHECKING:
     VLLM_GC_DEBUG: str = ""
     VLLM_DEBUG_WORKSPACE: bool = False
     VLLM_ENABLE_K3_LATENT_MOE_TAIL_FUSION: bool = False
+    VLLM_ROCM_USE_KIMI_K3_LATENT_TAIL_FP8: bool = False
     VLLM_ROCM_USE_KIMI_K3_PREROUTE_BF16: bool = False
     VLLM_ROCM_USE_KIMI_K3_PREROUTE_FP8: bool = False
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
@@ -1158,6 +1159,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt-in Kimi-K3 B1 weight-only FP8 pre-route projections on gfx950.
     "VLLM_ROCM_USE_KIMI_K3_PREROUTE_FP8": lambda: (
         os.getenv("VLLM_ROCM_USE_KIMI_K3_PREROUTE_FP8", "0").lower() in ("true", "1")
+    ),
+    # Use rowwise OCP-E4M3 weights in the gfx950 Kimi-K3 B1 latent-MoE tail.
+    "VLLM_ROCM_USE_KIMI_K3_LATENT_TAIL_FP8": lambda: (
+        os.getenv("VLLM_ROCM_USE_KIMI_K3_LATENT_TAIL_FP8", "0").lower()
+        in ("true", "1")
     ),
     # Opt-in Kimi-K3 B1 exact-BF16 pre-route projections on gfx950.
     "VLLM_ROCM_USE_KIMI_K3_PREROUTE_BF16": lambda: (
