@@ -67,6 +67,7 @@ from vllm.model_executor.models.utils import (
 from vllm.models.kimi_k3.amd.kda import KimiGatedDeltaNetAttention
 from vllm.models.kimi_k3.amd.ops.attn_res import attn_res
 from vllm.models.kimi_k3.amd.ops.mla_gate import kimi_k3_mla_output_gate
+from vllm.models.kimi_k3.amd.ops.moe_gate import KimiK3AiterGateLinear
 from vllm.models.kimi_k3.amd.ops.moe_preroute import (
     KimiK3PrerouteBf16,
     KimiK3PrerouteFp8Weights,
@@ -343,7 +344,7 @@ class KimiMoE(nn.Module):
         self.activation_situ_linear_beta = activation_situ_linear_beta
 
         # Route with fp32 logits for numerically stable expert selection.
-        self.gate = GateLinear(
+        self.gate = KimiK3AiterGateLinear(
             input_size=hidden_size,
             output_size=num_experts,
             bias=False,
