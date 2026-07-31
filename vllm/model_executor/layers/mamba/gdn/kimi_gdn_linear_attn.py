@@ -300,7 +300,11 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 quant_config=self.quant_config,
                 prefix=f"{prefix}.g_b_proj",
             )
-        self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
+        self.o_norm = FusedRMSNormGated(
+            self.head_dim,
+            activation="sigmoid",
+            enforce_enable=current_platform.is_rocm(),
+        )
         self.o_proj = RowParallelLinear(
             self.projection_size,
             self.hidden_size,
@@ -324,6 +328,10 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         qkv = qkv.permute(1, 0, 2, 3).contiguous().unsqueeze(1)
         return qkv.unbind(0)
 
+    def _project_qkvgfab(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Projection seam for platform-specific subclasses."""
+        return self.in_proj_qkvgfab(hidden_states)[0]
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -331,7 +339,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         output: torch.Tensor,
     ) -> None:
         num_tokens = hidden_states.size(0)
-        projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
+        projected_qkvgfab = self._project_qkvgfab(hidden_states)
         if self.use_full_rank_gate:
             split_sizes = [
                 3 * self.local_projection_size,
@@ -354,10 +362,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
             g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
 
-        g1 = self.f_b_proj(f_a)[0]
         beta = beta.unsqueeze(0)
-        g1 = rearrange(g1, "n (h d) -> 1 n h d", d=self.head_dim)
-
         g2 = rearrange(g_proj_states, "... (h d) -> ... h d", d=self.head_dim)
 
         core_attn_out = torch.empty(
@@ -366,15 +371,41 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             device=hidden_states.device,
         )
 
-        self._forward(
+        self._run_core(
+            f_a=f_a,
             mixed_qkv=mixed_qkv,
-            g1=g1,
-            g2=g2,
             beta=beta,
+            output_gate=g2,
             core_attn_out=core_attn_out,
         )
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
+        self._project_output(core_attn_out, output)
+
+    def _project_output(
+        self,
+        core_attn_out: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
         output[:] = self.o_proj(core_attn_out)[0]
+
+    def _run_core(
+        self,
+        *,
+        f_a: torch.Tensor,
+        mixed_qkv: torch.Tensor,
+        beta: torch.Tensor,
+        output_gate: torch.Tensor,
+        core_attn_out: torch.Tensor,
+    ) -> None:
+        g1 = self.f_b_proj(f_a)[0]
+        g1 = rearrange(g1, "n (h d) -> 1 n h d", d=self.head_dim)
+        self._forward(
+            mixed_qkv=mixed_qkv,
+            g1=g1,
+            g2=output_gate,
+            beta=beta,
+            core_attn_out=core_attn_out,
+        )
 
     @eager_break_during_capture
     def _forward(
