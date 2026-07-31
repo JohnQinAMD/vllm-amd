@@ -162,6 +162,15 @@ def rocm_unquantized_gemm_impl(
     )
 
     if use_skinny_reduce_counting:
+        # ITEM 4: wvSplitKrc takes the ACTIVATION as in_a (note the argument
+        # order differs from wvSplitK) and its preload has the same linear
+        # `min__(Kap * N, max_lds_len)` bound with an UNGUARDED s[k_ + Kap * n]
+        # read. The condition above checks weight.is_contiguous() but never x,
+        # and fits_wvsplitkrc is a work-size/atomic-counter check, not an LDS or
+        # contiguity check -- so a strided activation reaches it exactly as it
+        # reached wvSplitK. Materialise for the same reason.
+        if not x.is_contiguous():
+            x = x.contiguous()
         return ops.wvSplitKrc(x, weight, cu_count, bias)
 
     if use_aiter_triton_gemm(n, m, k, x.dtype):
@@ -178,8 +187,32 @@ def rocm_unquantized_gemm_impl(
 
     if use_skinny:
         x_view = x.reshape(-1, x.size(-1))
-        if m > 8 and 0 < n <= 5:
-            cu_count = num_compute_units()
+        # wvSplitK's LDS preload reads the activation operand LINEARLY for
+        # (row_stride * N) elements -- it never indexes by row, it assumes a
+        # dense N x stride block. For a contiguous tensor stride == K and that
+        # lands exactly on the last element. For a strided view (e.g. [4, 128]
+        # with row stride 6288) it runs (stride - K) elements past the end of
+        # the storage -- here 6160 elements (~12 KB). That over-read is silent
+        # whenever the next page is mapped and a hard memory-access fault when
+        # it is not, which is why it only surfaces for some
+        # max_num_seqs / cudagraph-capture combinations.
+        # skinny_gemms.cu states the constraint itself: these kernels "do not
+        # take strides, and are unable to handle PyTorch tensors that return
+        # is_contiguous() as False".
+        # Materialise instead of skipping: the diverted shapes here are tiny
+        # (N <= 5 rows), so the copy is a few KB and the fast kernel is kept.
+        if not x_view.is_contiguous():
+            x_view = x_view.contiguous()
+        # Shape guards from a measured sweep of all 12 (M,K) pairs Kimi-K3
+        # issues, N=1..5, wvSplitK vs torch.nn.functional.linear on MI355X:
+        #   * N>=5 with M>=8192 collapses: M=20480,K=7168 goes 44.9us -> 189.8us
+        #     (0.28x) and M=8448,K=7168 19.2 -> 33.0us (0.72x). The N=5 template
+        #     regime is the one added for spec decode; it is a cliff, not a taper.
+        #   * tall-skinny M>=100000 loses from N>=2: M=163840,K=256 is 0.88x at
+        #     N=2, 0.62x at N=4, 0.07x at N=5 (32.6us vs torch 20.2us at N=4).
+        # Everything else wins by 1.2x-3.2x, so only these two regimes divert.
+        _wv_bad_shape = (n >= 5 and m >= 8192) or (m >= 100000)
+        if m > 8 and 0 < n <= 5 and weight.is_contiguous() and not _wv_bad_shape:
             out = ops.wvSplitK(weight, x_view, cu_count, bias)
             return out.reshape(*x.shape[:-1], weight.shape[0])
         elif m % 4 == 0 and n == 1 and k <= 8192 and bias is None:
