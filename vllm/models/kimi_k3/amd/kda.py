@@ -266,6 +266,13 @@ class KimiGatedDeltaNetAttention(_KimiGatedDeltaNetAttention):
             core_attn_out=core_attn_out,
         )
 
+    def _project_output(
+        self,
+        core_attn_out: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        self.o_proj(core_attn_out, output=output)
+
     @eager_break_during_capture
     def _try_aiter_kda_fb_decode(
         self,

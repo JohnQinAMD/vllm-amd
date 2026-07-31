@@ -53,8 +53,25 @@ class AiterCustomAllreduce:
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
         return self._impl.should_custom_ar(inp)
 
-    def custom_all_reduce(self, inp: torch.Tensor) -> torch.Tensor | None:
-        return self._impl.custom_all_reduce(inp)
+    @property
+    def supports_custom_all_reduce_out(self) -> bool:
+        return bool(
+            getattr(
+                self._impl,
+                "supports_custom_all_reduce_out",
+                False,
+            )
+        )
+
+    def custom_all_reduce(
+        self,
+        inp: torch.Tensor,
+        *,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
+        if out is None:
+            return self._impl.custom_all_reduce(inp)
+        return self._impl.custom_all_reduce(inp, out=out)
 
     def capture(self):
         return self._impl.capture()

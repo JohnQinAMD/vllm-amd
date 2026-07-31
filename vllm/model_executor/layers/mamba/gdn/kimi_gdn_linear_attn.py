@@ -375,6 +375,13 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out=core_attn_out,
         )
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
+        self._project_output(core_attn_out, output)
+
+    def _project_output(
+        self,
+        core_attn_out: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
         output[:] = self.o_proj(core_attn_out)[0]
 
     def _run_core(
