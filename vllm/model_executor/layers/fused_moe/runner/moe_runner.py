@@ -388,11 +388,20 @@ class MoERunner(MoERunnerInterface):
             fused_output = r[0] if isinstance(r, tuple) else r
         return fused_output
 
+    def apply_routed_output_transform_and_add_shared(
+        self,
+        shared_output: torch.Tensor | None,
+        fused_output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply the routed transform, then combine the shared output."""
+        fused_output = self.apply_routed_output_transform(fused_output)
+        return fused_output if shared_output is None else shared_output + fused_output
+
     def _maybe_apply_routed_scale_to_output(
         self,
         shared_output: torch.Tensor | None,
         fused_output: torch.Tensor,
-    ) -> tuple[torch.Tensor | None, torch.Tensor, bool]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
         """Apply routed_scaling_factor to the output with FP16 overflow
         protection.
 
@@ -400,15 +409,13 @@ class MoERunner(MoERunnerInterface):
         avoid overflow by dividing shared_output by the scale instead
         (the decoder layer compensates with matching divisions).
 
-        Returns the shared output, routed output, and whether the routed output
-        transform has already been applied by an optimized subclass.
         """
         if self.routed_scaling_factor != 1.0:
             if fused_output.dtype != torch.float16 or shared_output is None:
                 fused_output *= self.routed_scaling_factor
             elif shared_output is not None:
                 shared_output *= 1.0 / self.routed_scaling_factor
-        return shared_output, fused_output, False
+        return shared_output, fused_output
 
     @property
     def _fused_output_is_reduced(self) -> bool:
@@ -764,17 +771,13 @@ class MoERunner(MoERunnerInterface):
             shared_output, fused_output_is_reduced
         )
 
-        shared_output, fused_output, routed_transform_applied = (
-            self._maybe_apply_routed_scale_to_output(shared_output, fused_output)
+        shared_output, fused_output = self._maybe_apply_routed_scale_to_output(
+            shared_output, fused_output
         )
 
-        if not routed_transform_applied:
-            fused_output = self.apply_routed_output_transform(fused_output)
-
-        if shared_output is not None:
-            result = shared_output + fused_output
-        else:
-            result = fused_output
+        result = self.apply_routed_output_transform_and_add_shared(
+            shared_output, fused_output
+        )
 
         result = self._maybe_reduce_final_output(
             result, og_hidden_dim_post_xform, fused_output_is_reduced
