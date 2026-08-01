@@ -21,14 +21,19 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _transform() -> KimiRoutedOutputTransform:
+def _transform(
+    latent_size: int = 3584,
+    output_size: int = 7168,
+) -> KimiRoutedOutputTransform:
     transform = object.__new__(KimiRoutedOutputTransform)
     nn.Module.__init__(transform)
     transform.norm = SimpleNamespace(
-        weight=torch.empty(3584, device="meta"),
+        weight=torch.empty(latent_size, device="meta"),
         variance_epsilon=1.0e-6,
     )
-    transform.up_proj = SimpleNamespace(weight=torch.empty(7168, 3584, device="meta"))
+    transform.up_proj = SimpleNamespace(
+        weight=torch.empty(output_size, latent_size, device="meta")
+    )
     return transform
 
 
@@ -91,27 +96,35 @@ def test_runner_fuses_supported_tail_and_preserves_fallback(monkeypatch):
     runner = object.__new__(KimiAMDLatentMoERunner)
     nn.Module.__init__(runner)
     runner.routed_scaling_factor = 1.0
-    transform = _transform()
+    transform = _transform(latent_size=2, output_size=4)
     runner.routed_output_transform = transform
 
-    routed = torch.tensor([[1.0]])
-    shared = torch.tensor([[2.0]])
-    fused_result = torch.tensor([[3.0]])
+    routed = torch.tensor([[1.0, 2.0]])
+    shared = torch.tensor([[3.0, 4.0, 5.0, 6.0]])
+    fused_result = torch.tensor([[7.0, 8.0, 9.0, 10.0]])
 
     monkeypatch.setattr(
         transform,
         "forward_with_shared",
         lambda routed, shared: fused_result,
     )
-    result = runner.apply_routed_output_transform_and_add_shared(shared, routed)
+    remaining_shared, result = runner._maybe_apply_routed_scale_to_output(
+        shared, routed
+    )
+    assert remaining_shared is None
     assert result is fused_result
+    assert runner.apply_routed_output_transform(result) is fused_result
 
-    fallback_result = torch.tensor([[4.0]])
+    fallback_result = torch.tensor([[11.0, 12.0, 13.0, 14.0]])
     monkeypatch.setattr(
         transform,
         "forward_with_shared",
         lambda routed, shared: None,
     )
     monkeypatch.setattr(transform, "forward", lambda routed: fallback_result)
-    result = runner.apply_routed_output_transform_and_add_shared(shared, routed)
-    torch.testing.assert_close(result, shared + fallback_result)
+    remaining_shared, result = runner._maybe_apply_routed_scale_to_output(
+        shared, routed
+    )
+    assert remaining_shared is shared
+    assert result is routed
+    assert runner.apply_routed_output_transform(result) is fallback_result

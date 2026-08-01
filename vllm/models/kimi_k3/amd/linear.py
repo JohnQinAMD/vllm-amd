@@ -174,21 +174,35 @@ class KimiRoutedOutputTransform(nn.Module):
 class KimiAMDLatentMoERunner(MoERunner):
     """Use the AMD local-tail primitive after routed/shared reductions."""
 
-    def apply_routed_output_transform_and_add_shared(
+    def _maybe_apply_routed_scale_to_output(
         self,
         shared_output: torch.Tensor | None,
         fused_output: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        shared_output, fused_output = super()._maybe_apply_routed_scale_to_output(
+            shared_output, fused_output
+        )
         transform = self.routed_output_transform
         if shared_output is not None and isinstance(
             transform, KimiRoutedOutputTransform
         ):
             result = transform.forward_with_shared(fused_output, shared_output)
             if result is not None:
-                return result
-        return super().apply_routed_output_transform_and_add_shared(
-            shared_output, fused_output
-        )
+                return None, result
+        return shared_output, fused_output
+
+    def apply_routed_output_transform(
+        self,
+        fused_output: torch.Tensor,
+    ) -> torch.Tensor:
+        transform = self.routed_output_transform
+        if (
+            isinstance(transform, KimiRoutedOutputTransform)
+            # The fused tail returns the full up-projection width.
+            and fused_output.shape[-1] == transform.up_proj.weight.shape[0]
+        ):
+            return fused_output
+        return super().apply_routed_output_transform(fused_output)
 
 
 def _apply_attn_res(
