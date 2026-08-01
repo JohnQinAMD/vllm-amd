@@ -1011,6 +1011,10 @@ class MLAAttentionImpl(AttentionImplBase[T], Generic[T]):
 
     supports_pcp: bool = True
 
+    def use_quantized_query_input(self, attn_metadata: T) -> bool:
+        """Return the query format selected by this backend for the call."""
+        return self.supports_quant_query_input
+
     @abstractmethod
     def __init__(
         self,

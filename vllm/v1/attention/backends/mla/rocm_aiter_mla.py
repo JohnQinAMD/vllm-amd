@@ -3,6 +3,7 @@
 
 import functools
 from dataclasses import dataclass
+from enum import Enum
 from typing import ClassVar, Final
 
 import torch
@@ -20,7 +21,6 @@ from vllm.model_executor.layers.attention.mla_attention import (
     QueryLenSupport,
 )
 from vllm.triton_utils import tl, triton
-from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionLayer,
@@ -30,6 +30,11 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import AttentionSpec, is_quantized_kv_cache
 
 logger = init_logger(__name__)
+
+
+class AiterMLADecodeBackend(str, Enum):
+    ASM = "asm"
+    GLUON = "gluon"
 
 
 @functools.lru_cache(maxsize=1)
@@ -56,6 +61,15 @@ def _get_mla_gluon():
                 "Gluon MLA kernel (mla_gluon or mla_decode_gluon) when decode "
                 "heads are fewer than 16."
             ) from unified_import_error
+
+
+@functools.lru_cache(maxsize=1)
+def _gluon_mla_capabilities() -> frozenset[str]:
+    try:
+        from aiter.ops.triton.gluon.mla_gluon import MLA_GLUON_CAPABILITIES
+    except (ImportError, ModuleNotFoundError):
+        return frozenset()
+    return frozenset(MLA_GLUON_CAPABILITIES)
 
 
 @functools.lru_cache(maxsize=1)
@@ -175,8 +189,7 @@ class AiterMLADecodeMetadata(MLACommonDecodeMetadata):
     max_qo_len: int | None = None
     # Minimum KV length used by Gluon to choose a safe split count.
     min_kv_seq_len: int = 1
-    # Small-head decode uses Gluon (avoids padding to 16).
-    use_gluon_decode: bool = False
+    decode_backend: AiterMLADecodeBackend = AiterMLADecodeBackend.ASM
     # Whether persistent MLA metadata was computed
     has_persistent_metadata: bool = False
 
@@ -627,9 +640,12 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                 seq_lens_for_kernel.cumsum(dim=0, dtype=torch.int32),
             ]
         )
-        use_gluon_decode = AiterMLAHelper.use_gluon_decode(
+        decode_backend = AiterMLAHelper.select_decode_backend(
             self.num_heads, int(max_qo_len), self._kv_cache_dtype_str
         )
+        min_kv_seq_len = 1
+        if not self.compilation_config.cudagraph_mode.has_full_cudagraphs():
+            min_kv_seq_len = int(seq_lens_for_kernel.min().item())
 
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.paged_kv_indices.fill_(-1)
@@ -710,12 +726,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         #   fp8 mla decoding with qo_len <= 4 and qo_len > 4 in persistent mode
         has_persistent_metadata = False
         use_persistent_metadata = (
-            not AiterMLAHelper.use_gluon_decode(
-                self.num_heads, max_qo_len, self._kv_cache_dtype_str
-            )
-            and not AiterMLAHelper.use_gluon_verify(
-                self.num_heads, max_qo_len, self._kv_cache_dtype_str
-            )
+            decode_backend is AiterMLADecodeBackend.ASM
             and max_qo_len >= 1
             and max_qo_len <= self._mtp_decode_qlen
         )
@@ -757,7 +768,8 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             qo_indptr=qo_indptr,
             dcp_tot_seq_lens=dcp_tot_seq_lens_device,
             max_qo_len=max_qo_len,
-            use_gluon_decode=use_gluon_decode,
+            min_kv_seq_len=min_kv_seq_len,
+            decode_backend=decode_backend,
             attn_out_dtype=self.decode_attn_out_dtype,
             has_persistent_metadata=has_persistent_metadata,
         )
@@ -904,57 +916,51 @@ class AiterMLAHelper:
         return o[:, :num_heads, :]
 
     @staticmethod
-    def use_gluon_decode(num_heads: int, max_qo_len: int, kv_cache_dtype: str) -> bool:
-        # Small-head (<16) single-token decode can use either the Gluon kernel
-        # or the padded asm persistent decode, selected by
-        # VLLM_ROCM_AITER_MLA_ASM_PADDING (see _aiter_mla_small_head_mode) and
-        # the arch: Gluon only has a gfx950 build. In "auto" (default) mode
-        # divisor counts keep Gluon on gfx950 and everything else -- non-divisor
-        # counts (e.g. 12 heads/rank at TP8) and all counts on gfx942 -- takes
-        # the asm path, which get_mla_padded_q pads to exactly 16.
+    def select_decode_backend(
+        num_heads: int, max_qo_len: int, kv_cache_dtype: str
+    ) -> AiterMLADecodeBackend:
         m = AiterMLAHelper._AITER_MIN_MLA_HEADS
-        if num_heads >= m or max_qo_len != 1:
-            return False
-        # Gluon has exactly one fp8-KV regime, bh16bn128. It is a bf16-query
-        # kernel that upcasts the cache in registers with a hardcoded scale of
-        # 1.0, and it asserts batch_size == 1, so it cannot serve a real decode
-        # batch at any head count. A quantized cache always goes to the asm
-        # decode, which ships true fp8 kernels for gqa=16
-        # (mla_a8w8_qh16_qseqlen*_gqaratio16*.co). This precedes the mode knob:
-        # an explicit "gluon" request under fp8 would assert immediately.
-        if is_quantized_kv_cache(kv_cache_dtype):
-            return False
+        if num_heads >= m:
+            return AiterMLADecodeBackend.ASM
         mode = _aiter_mla_small_head_mode()
-        if mode == "asm":
-            return False
-        gluon_supported = _gluon_mla_decode_supported()
+        if mode == "asm" or not _gluon_mla_decode_supported():
+            return AiterMLADecodeBackend.ASM
+        if is_quantized_kv_cache(kv_cache_dtype):
+            capability = (
+                "fp8_kv_batched_decode" if max_qo_len == 1 else "fp8_kv_mtp_decode"
+            )
+            required = {capability, "fp8_kv_scale"}
+            if max_qo_len > 4 or not required <= _gluon_mla_capabilities():
+                return AiterMLADecodeBackend.ASM
+            return AiterMLADecodeBackend.GLUON
+        if max_qo_len > 1:
+            return AiterMLADecodeBackend.GLUON
         if mode == "gluon":
-            return gluon_supported
-        return m % num_heads == 0 and gluon_supported
+            return AiterMLADecodeBackend.GLUON
+        if m % num_heads == 0:
+            return AiterMLADecodeBackend.GLUON
+        return AiterMLADecodeBackend.ASM
+
+    @staticmethod
+    def use_gluon_decode(num_heads: int, max_qo_len: int, kv_cache_dtype: str) -> bool:
+        return (
+            max_qo_len == 1
+            and AiterMLAHelper.select_decode_backend(
+                num_heads, max_qo_len, kv_cache_dtype
+            )
+            is AiterMLADecodeBackend.GLUON
+        )
 
     @staticmethod
     def use_gluon_verify(num_heads: int, max_qo_len: int, kv_cache_dtype: str) -> bool:
-        """Whether a small-head multi-token verify is flattened onto Gluon.
-
-        The bf16 asm kernels have no gqa < 16, qseqlen > 1 entry, so a small-head
-        verify is flattened into per-token qseqlen=1 Gluon decodes. fp8 does have
-        one, reached by the q-row fold (16 heads x qlen 8 folds onto the
-        nhead=32, qseqlen=4 kernel, which ships in the package), and must not
-        come here: the flatten hands Gluon a batch of exactly the size that its
-        fp8 regime asserts against.
-
-        This lives next to use_gluon_decode rather than inline in forward_mqa so
-        that the builder, which has to know whether the asm decode will run, sees
-        the same answer the impl acts on.
-        """
-        if num_heads >= AiterMLAHelper._AITER_MIN_MLA_HEADS or max_qo_len <= 1:
-            return False
-        if is_quantized_kv_cache(kv_cache_dtype):
-            return False
-        # Same arch and mode gating as use_gluon_decode: Gluon only has a gfx950
-        # build, and VLLM_ROCM_AITER_MLA_ASM_PADDING=asm forces the asm path,
-        # which pads to 16 heads and handles qlen>1 verify directly.
-        return _aiter_mla_small_head_mode() != "asm" and _gluon_mla_decode_supported()
+        """Whether a small-head multi-token verify uses native Gluon MTP."""
+        return (
+            max_qo_len > 1
+            and AiterMLAHelper.select_decode_backend(
+                num_heads, max_qo_len, kv_cache_dtype
+            )
+            is AiterMLADecodeBackend.GLUON
+        )
 
 
 class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
@@ -988,17 +994,6 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         )
         AiterMLAHelper.check_num_heads_validity(num_heads)
 
-        # Decode with fewer than 16 heads is served by AITER's Gluon MLA
-        # kernel. Its fp8 KV regime (bh16bn128) takes a bf16 query and folds
-        # the KV dequant scale into the QK temperature, so a pre-quantized
-        # query is rejected with "q_nope/q_pe must be bf16". Tell the common
-        # layer to leave the query alone, as TritonMLAImpl already does for
-        # its own fp8 KV path.
-        if num_heads < AiterMLAHelper._AITER_MIN_MLA_HEADS and is_quantized_kv_cache(
-            self.kv_cache_dtype
-        ):
-            self.supports_quant_query_input = False
-
         unsupported_features = [alibi_slopes, sliding_window, logits_soft_cap]
         if any(unsupported_features):
             raise NotImplementedError(
@@ -1021,6 +1016,10 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
 
             self._mla_prefill_ps_asm_fwd = mla_prefill_ps_asm_fwd
             self._mla_reduce_v1 = mla_reduce_v1
+
+    def use_quantized_query_input(self, attn_metadata: AiterMLAMetadata) -> bool:
+        decode = attn_metadata.decode
+        return decode is None or decode.decode_backend is AiterMLADecodeBackend.ASM
 
     def _flash_attn_varlen_diff_headdims(
         self, q, k, v, return_softmax_lse=False, softmax_scale=None, **kwargs
@@ -1211,17 +1210,27 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         assert decode.max_qo_len is not None
         assert decode.paged_kv_indptr is not None
         assert decode.paged_kv_indices is not None
-        if decode.use_gluon_decode:
+        if decode.decode_backend is AiterMLADecodeBackend.GLUON:
             if type(q) is tuple:
                 q_nope, q_pe = q
             else:
                 q_nope, q_pe = torch.split(
                     q, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
                 )
-            B, num_q_heads, _ = q_nope.shape
+            num_tokens, num_q_heads, _ = q_nope.shape
+            qlen = int(decode.max_qo_len)
+            if num_tokens % qlen != 0:
+                raise ValueError(
+                    f"Gluon MLA requires uniform query lengths, got "
+                    f"{num_tokens} tokens and query length {qlen}"
+                )
+            batch_size = num_tokens // qlen
+            if qlen > 1:
+                # Gluon applies the causal tail for native 4-D MTP queries.
+                q_nope = q_nope.view(batch_size, qlen, num_q_heads, self.kv_lora_rank)
+                q_pe = q_pe.view(batch_size, qlen, num_q_heads, self.qk_rope_head_dim)
             o = torch.empty(
-                B,
-                num_q_heads,
+                *q_nope.shape[:-1],
                 self.kv_lora_rank,
                 dtype=decode.attn_out_dtype,
                 device=q_nope.device,
@@ -1239,92 +1248,14 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                 k_pe=None,
                 kv_pe_offset=self.kv_lora_rank,
                 use_2d_view=False,
-                kv_scale=1.0,
+                kv_scale=(
+                    layer._k_scale_float
+                    if is_quantized_kv_cache(self.kv_cache_dtype)
+                    else 1.0
+                ),
                 min_kv_seq_len=decode.min_kv_seq_len,
             )
-            return o, None
-
-        # 12-head (<16) multi-token verify (DSpark): the asm path has no
-        # gqa<16, qseqlen>1 kernel. Flatten each verify token to its own
-        # qseqlen=1 gluon decode, mirroring the TRITON_MLA / sparse-backend
-        # flatten but on the fast gluon kernel. The block is causal -- the
-        # target is checking draft tokens, so position t must not see t+1 --
-        # and attention rows are independent, so giving row t the KV range
-        # [0, context + t] is exactly causal multi-token attention.
-        # Arch, mode and dtype gating all live in use_gluon_verify, so that the
-        # builder -- which has to know whether the asm decode will run -- sees
-        # the same answer as this branch.
-        if AiterMLAHelper.use_gluon_verify(
-            self.num_heads, int(decode.max_qo_len), self.kv_cache_dtype
-        ):
-            qlen = int(decode.max_qo_len)
-            if type(q) is tuple:
-                q_nope, q_pe = q
-            else:
-                q_nope, q_pe = torch.split(
-                    q, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-                )
-            B, num_q_heads, _ = q_nope.shape
-            o = torch.empty(
-                B,
-                num_q_heads,
-                self.kv_lora_rank,
-                dtype=decode.attn_out_dtype,
-                device=q_nope.device,
-            )
-            kv_buffer = kv_c_and_k_pe_cache.reshape(-1, kv_c_and_k_pe_cache.shape[-1])
-            # Expand per-request paged-KV to per-verify-token. Row r*qlen+t is
-            # request r's verify token t, and seq_lens counts the tokens
-            # scheduled in this step, so a request's KV range already spans its
-            # whole verify block and context_r = seq_len_r - qlen. Token t may
-            # attend to [0, context_r + t], i.e. seq_len_r - (qlen - 1) + t
-            # entries. paged_kv_indices lists a request's pages in ascending
-            # position order, so each row's causal window is a prefix of that
-            # request's slice and only the row length changes. Rows clamp to
-            # zero for cudagraph padding requests, whose seq_len is 0. Fully
-            # vectorized (no host loop).
-            old_indptr = decode.paged_kv_indptr
-            per_req_len = old_indptr[1:] - old_indptr[:-1]
-            dev = q_nope.device
-            row_req = torch.arange(per_req_len.shape[0], device=dev).repeat_interleave(
-                qlen
-            )
-            row_len = (
-                (
-                    per_req_len.unsqueeze(1)
-                    - (qlen - 1)
-                    + torch.arange(qlen, device=dev, dtype=per_req_len.dtype)
-                )
-                .clamp_(min=0)
-                .flatten()
-            )
-            new_indptr = torch.cat([old_indptr.new_zeros(1), row_len.cumsum(0)]).to(
-                torch.int32
-            )
-            total = int(new_indptr[-1].item())
-            within = torch.arange(total, device=dev, dtype=torch.int64) - new_indptr[
-                :-1
-            ].to(torch.int64).repeat_interleave(row_len)
-            src = (
-                old_indptr[row_req].to(torch.int64).repeat_interleave(row_len) + within
-            )
-            new_indices = decode.paged_kv_indices[src]
-            mla_gluon = _get_mla_gluon()
-            mla_gluon(
-                q_nope=q_nope,
-                q_pe=q_pe,
-                kv_c=kv_buffer,
-                o=o,
-                page_table=new_indices,
-                seq_info=new_indptr,
-                sm_scale=self.scale,
-                k_pe=None,
-                kv_pe_offset=self.kv_lora_rank,
-                use_2d_view=False,
-                kv_scale=1.0,
-                min_kv_seq_len=int(row_len.min()),
-            )
-            return o, None
+            return o.view(num_tokens, num_q_heads, self.kv_lora_rank), None
 
         if type(q) is tuple:
             q = torch.cat(q, dim=-1)

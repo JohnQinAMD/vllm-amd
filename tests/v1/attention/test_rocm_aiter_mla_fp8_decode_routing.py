@@ -1,14 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Decode-kernel routing for the ROCm AITER MLA backend.
-
-Gluon exposes a single fp8-KV regime, bh16bn128. It is a bf16-query kernel that
-upcasts the cache in registers with a hardcoded scale of 1.0, and it asserts
-batch_size == 1, so it cannot serve a decode batch. Every fp8 shape therefore
-has to land on the asm kernels, which ship real fp8 variants for gqa=16. These
-tests pin that down at the predicates, since the failure it prevents is either a
-batch assertion or -- worse -- a silently wrong result.
-"""
+"""Decode-kernel routing for the ROCm AITER MLA backend."""
 
 import pytest
 import torch
@@ -27,46 +19,70 @@ UNQUANTIZED_DTYPES = ["auto", "bfloat16"]
 
 @pytest.fixture
 def gluon_available(monkeypatch):
-    """Pin the arch gate and the mode knob so only the dtype rules are in play.
-
-    Gluon ships a gfx950 build only, and VLLM_ROCM_AITER_MLA_ASM_PADDING can
-    force the asm path on any arch. Without pinning both, the expectations that
-    bf16 *keeps* Gluon would pass on a gfx950 host and fail on gfx942 for
-    reasons that have nothing to do with what these tests cover.
-    """
+    """Pin gfx950 auto routing."""
     monkeypatch.setattr(rocm_aiter_mla, "_gluon_mla_decode_supported", lambda: True)
     monkeypatch.setattr(rocm_aiter_mla, "_aiter_mla_small_head_mode", lambda: "auto")
+    monkeypatch.setattr(
+        rocm_aiter_mla,
+        "_gluon_mla_capabilities",
+        lambda: frozenset(
+            {"fp8_kv_batched_decode", "fp8_kv_mtp_decode", "fp8_kv_scale"}
+        ),
+    )
 
 
 @pytest.mark.parametrize("kv_cache_dtype", FP8_DTYPES)
-@pytest.mark.parametrize("num_heads", [1, 2, 4, 5, 6, 8, 12, 16, 32, 128])
-@pytest.mark.parametrize("max_qo_len", [1, 2, 4, 5, 8, 15])
-def test_fp8_never_routes_to_gluon(kv_cache_dtype, num_heads, max_qo_len):
-    """No fp8 shape reaches either Gluon entry point.
-
-    The head count is deliberately swept across divisors of 16 as well as
-    non-divisors: the divisor case (e.g. 8 heads at TP8) is the one that stays
-    on Gluon for bf16 and so is the one an fp8 guard has to override.
-    """
-    assert not AiterMLAHelper.use_gluon_decode(num_heads, max_qo_len, kv_cache_dtype)
-    assert not AiterMLAHelper.use_gluon_verify(num_heads, max_qo_len, kv_cache_dtype)
+@pytest.mark.parametrize("num_heads", [1, 2, 4, 5, 6, 8, 12, 15])
+@pytest.mark.parametrize("max_qo_len", [1, 2, 4, 5])
+def test_fp8_uses_gluon_on_gfx950(
+    gluon_available, kv_cache_dtype, num_heads, max_qo_len
+):
+    """AITER #4480 enables batched FP8 decode and native MTP on gfx950."""
+    assert AiterMLAHelper.use_gluon_decode(num_heads, max_qo_len, kv_cache_dtype) == (
+        max_qo_len == 1
+    )
+    assert AiterMLAHelper.use_gluon_verify(num_heads, max_qo_len, kv_cache_dtype) == (
+        1 < max_qo_len <= 4
+    )
 
 
 @pytest.mark.parametrize("kv_cache_dtype", FP8_DTYPES)
 @pytest.mark.parametrize("num_heads", [1, 2, 4, 8, 12])
-@pytest.mark.parametrize("mode", ["auto", "gluon", "asm"])
-def test_fp8_never_routes_to_gluon_under_any_mode(
-    monkeypatch, kv_cache_dtype, num_heads, mode
+@pytest.mark.parametrize(
+    "mode, expected", [("auto", True), ("gluon", True), ("asm", False)]
+)
+def test_fp8_honors_small_head_mode(
+    monkeypatch, kv_cache_dtype, num_heads, mode, expected
 ):
-    """VLLM_ROCM_AITER_MLA_ASM_PADDING cannot force an fp8 cache onto Gluon.
-
-    The dtype guard deliberately precedes the mode knob: honouring an explicit
-    "gluon" request under fp8 would hand Gluon the batch it asserts against, so
-    it is overridden rather than obeyed. Pinned here because the override is a
-    correctness decision, not a preference.
-    """
     monkeypatch.setattr(rocm_aiter_mla, "_gluon_mla_decode_supported", lambda: True)
     monkeypatch.setattr(rocm_aiter_mla, "_aiter_mla_small_head_mode", lambda: mode)
+    monkeypatch.setattr(
+        rocm_aiter_mla,
+        "_gluon_mla_capabilities",
+        lambda: frozenset(
+            {"fp8_kv_batched_decode", "fp8_kv_mtp_decode", "fp8_kv_scale"}
+        ),
+    )
+    assert AiterMLAHelper.use_gluon_decode(num_heads, 1, kv_cache_dtype) == expected
+    assert AiterMLAHelper.use_gluon_verify(num_heads, 4, kv_cache_dtype) == expected
+
+
+@pytest.mark.parametrize("max_qo_len", [1, 4])
+def test_fp8_falls_back_without_capability(monkeypatch, max_qo_len):
+    monkeypatch.setattr(rocm_aiter_mla, "_gluon_mla_decode_supported", lambda: True)
+    monkeypatch.setattr(rocm_aiter_mla, "_aiter_mla_small_head_mode", lambda: "auto")
+    monkeypatch.setattr(rocm_aiter_mla, "_gluon_mla_capabilities", frozenset)
+    assert (
+        AiterMLAHelper.select_decode_backend(12, max_qo_len, "fp8")
+        is rocm_aiter_mla.AiterMLADecodeBackend.ASM
+    )
+
+
+@pytest.mark.parametrize("kv_cache_dtype", FP8_DTYPES)
+@pytest.mark.parametrize("num_heads", [1, 8, 12, 15])
+def test_fp8_uses_asm_without_gfx950(monkeypatch, kv_cache_dtype, num_heads):
+    monkeypatch.setattr(rocm_aiter_mla, "_gluon_mla_decode_supported", lambda: False)
+    monkeypatch.setattr(rocm_aiter_mla, "_aiter_mla_small_head_mode", lambda: "auto")
     assert not AiterMLAHelper.use_gluon_decode(num_heads, 1, kv_cache_dtype)
     assert not AiterMLAHelper.use_gluon_verify(num_heads, 8, kv_cache_dtype)
 
@@ -106,11 +122,7 @@ def test_unquantized_non_divisor_heads_use_asm_decode(kv_cache_dtype, num_heads)
 def test_unquantized_small_head_verify_keeps_gluon(
     gluon_available, kv_cache_dtype, num_heads, max_qo_len
 ):
-    """bf16 has no gqa<16, qseqlen>1 asm kernel, so verify still flattens onto Gluon.
-
-    Unlike the decode predicate, this one does not care whether the head count
-    divides 16 -- the flatten reshapes to qseqlen=1 either way.
-    """
+    """BF16 small-head verification uses native Gluon MTP."""
     assert AiterMLAHelper.use_gluon_verify(num_heads, max_qo_len, kv_cache_dtype)
     # The verify flatten is a separate entry point from the single-token decode.
     assert not AiterMLAHelper.use_gluon_decode(num_heads, max_qo_len, kv_cache_dtype)

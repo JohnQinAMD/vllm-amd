@@ -583,6 +583,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 rope_positions[:num_mqa_tokens] if rope_positions is not None else None,
                 cos_sin_cache,
                 slot_mapping[:num_mqa_tokens],
+                attn_metadata,
             )
             latent_out, _lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
                 mqa_q, self._attn_read_kv_cache(), attn_metadata, self
@@ -598,9 +599,9 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         positions: torch.Tensor | None,
         cos_sin_cache: torch.Tensor | None,
         slot_mapping: torch.Tensor,
+        attn_metadata: "MLACommonMetadata",
     ) -> torch.Tensor:
-        """Fused decode query-concat + latent cache insert, dispatched by cache
-        dtype (same policy as prefill: fp8 cache -> fp8 query)."""
+        """Build the decode query and update the cache for its dtype/backend."""
         if self.kv_cache_dtype == "fp8_ds_mla":
             cache = self.kv_cache
             if cache.dtype != torch.uint8:
@@ -617,10 +618,21 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 cos_sin_cache=cos_sin_cache,
             )
         if is_quantized_kv_cache(self.kv_cache_dtype):
-            assert self.impl.supports_quant_query_input, (  # type: ignore[attr-defined]
-                "Kimi-K3 fp8 KV cache decode requires a backend that accepts an "
-                "fp8 (quantized) query input."
-            )
+            if not self.impl.use_quantized_query_input(attn_metadata):  # type: ignore[attr-defined]
+                if positions is not None:
+                    assert self.rotary_emb is not None
+                    q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+                    q_pe = q_pe.to(ql_nope.dtype)
+                    k_pe = k_pe.to(kv_c_normed.dtype)
+                self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
+                    kv_c_normed,
+                    k_pe,
+                    self.kv_cache,
+                    slot_mapping,
+                    self.kv_cache_dtype,
+                    self._k_scale,
+                )
+                return torch.cat((ql_nope, q_pe), dim=-1)
             cache = self.kv_cache
             if cache.dtype != torch.float8_e4m3fn:
                 cache = cache.view(torch.float8_e4m3fn)
