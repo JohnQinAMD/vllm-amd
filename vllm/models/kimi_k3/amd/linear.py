@@ -461,11 +461,70 @@ class KimiMoE(nn.Module):
             self.activation_situ_linear_beta,
         )
 
+    def _apply_preroute_fp8_tri(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Pre-route cluster with the router GEMM folded into the same grid."""
+
+        if self._preroute_routed_weight is None:
+            return None
+
+        router_weight = getattr(self.gate, "weight", None)
+        if router_weight is None:
+            return None
+
+        assert self._preroute_routed_scale is not None
+        assert self._preroute_shared_gate_up_weight is not None
+        assert self._preroute_shared_gate_up_scale is not None
+        assert self._preroute_shared_down_weight is not None
+        assert self._preroute_shared_down_scale is not None
+        from vllm.models.kimi_k3.amd.ops.moe_preroute import (
+            kimi_k3_preroute_fp8_tri,
+            supports_kimi_k3_preroute_fp8_tri,
+        )
+
+        if not supports_kimi_k3_preroute_fp8_tri(
+            hidden_states,
+            self._preroute_routed_weight,
+            self._preroute_routed_scale,
+            self._preroute_shared_gate_up_weight,
+            self._preroute_shared_gate_up_scale,
+            self._preroute_shared_down_weight,
+            self._preroute_shared_down_scale,
+            router_weight,
+        ):
+            return None
+        return kimi_k3_preroute_fp8_tri(
+            hidden_states,
+            self._preroute_routed_weight,
+            self._preroute_routed_scale,
+            self._preroute_shared_gate_up_weight,
+            self._preroute_shared_gate_up_scale,
+            self._preroute_shared_down_weight,
+            self._preroute_shared_down_scale,
+            router_weight,
+            self.activation_situ_beta,
+            self.activation_situ_linear_beta,
+        )
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        router_logits, _ = self.gate(hidden_states)
+        # The tri-projection returns the router logits from the same grid, so the
+        # separate gate GEMM only runs when that fused path is unavailable.
+        router_logits = None
         preroute = self._apply_preroute_bf16(hidden_states)
+        if preroute is None:
+            tri = self._apply_preroute_fp8_tri(hidden_states)
+            if tri is not None:
+                logger.info_once(
+                    "Kimi-K3 FP8 tri-projection active; router GEMM is fused."
+                )
+                routed_tri, shared_tri, router_logits = tri
+                preroute = (routed_tri, shared_tri)
+        if router_logits is None:
+            router_logits, _ = self.gate(hidden_states)
         if preroute is None:
             preroute = self._apply_preroute_fp8(hidden_states)
         if preroute is None:
