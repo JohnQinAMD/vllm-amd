@@ -87,7 +87,7 @@ def test_forward_with_shared_preserves_fallbacks(monkeypatch):
     assert transform.forward_with_shared(routed, shared) is None
 
 
-def test_runner_consumes_fused_tail_once_without_leaking_state(monkeypatch):
+def test_runner_fuses_supported_tail_and_preserves_fallback(monkeypatch):
     runner = object.__new__(KimiAMDLatentMoERunner)
     nn.Module.__init__(runner)
     runner.routed_scaling_factor = 1.0
@@ -103,12 +103,8 @@ def test_runner_consumes_fused_tail_once_without_leaking_state(monkeypatch):
         "forward_with_shared",
         lambda routed, shared: fused_result,
     )
-    remaining_shared, result = runner._maybe_apply_routed_scale_to_output(
-        shared, routed
-    )
-    assert remaining_shared is None
+    result = runner.apply_routed_output_transform_and_add_shared(shared, routed)
     assert result is fused_result
-    assert runner.apply_routed_output_transform(result) is fused_result
 
     fallback_result = torch.tensor([[4.0]])
     monkeypatch.setattr(
@@ -117,9 +113,5 @@ def test_runner_consumes_fused_tail_once_without_leaking_state(monkeypatch):
         lambda routed, shared: None,
     )
     monkeypatch.setattr(transform, "forward", lambda routed: fallback_result)
-    remaining_shared, result = runner._maybe_apply_routed_scale_to_output(
-        shared, routed
-    )
-    assert remaining_shared is shared
-    assert result is routed
-    assert runner.apply_routed_output_transform(result) is fallback_result
+    result = runner.apply_routed_output_transform_and_add_shared(shared, routed)
+    torch.testing.assert_close(result, shared + fallback_result)

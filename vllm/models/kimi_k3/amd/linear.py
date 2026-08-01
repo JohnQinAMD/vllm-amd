@@ -174,39 +174,21 @@ class KimiRoutedOutputTransform(nn.Module):
 class KimiAMDLatentMoERunner(MoERunner):
     """Use the AMD local-tail primitive after routed/shared reductions."""
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self._skip_next_routed_output_transform = False
-
-    def _maybe_apply_routed_scale_to_output(
+    def apply_routed_output_transform_and_add_shared(
         self,
         shared_output: torch.Tensor | None,
         fused_output: torch.Tensor,
-    ) -> tuple[torch.Tensor | None, torch.Tensor]:
-        shared_output, fused_output = super()._maybe_apply_routed_scale_to_output(
-            shared_output, fused_output
-        )
-        self._skip_next_routed_output_transform = False
+    ) -> torch.Tensor:
         transform = self.routed_output_transform
         if shared_output is not None and isinstance(
             transform, KimiRoutedOutputTransform
         ):
             result = transform.forward_with_shared(fused_output, shared_output)
             if result is not None:
-                # MoERunner applies the routed transform in the next synchronous
-                # pipeline step. The fused primitive has already performed it.
-                self._skip_next_routed_output_transform = True
-                return None, result
-        return shared_output, fused_output
-
-    def apply_routed_output_transform(
-        self,
-        fused_output: torch.Tensor,
-    ) -> torch.Tensor:
-        if self._skip_next_routed_output_transform:
-            self._skip_next_routed_output_transform = False
-            return fused_output
-        return super().apply_routed_output_transform(fused_output)
+                return result
+        return super().apply_routed_output_transform_and_add_shared(
+            shared_output, fused_output
+        )
 
 
 def _apply_attn_res(
