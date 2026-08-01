@@ -252,3 +252,145 @@ def kimi_k3_preroute_fp8(
         situ_beta,
         situ_linear_beta,
     )
+
+
+def supports_kimi_k3_preroute_fp8_tri(
+    hidden_states: torch.Tensor,
+    routed_weight: torch.Tensor,
+    routed_scale: torch.Tensor,
+    shared_gate_up_weight: torch.Tensor,
+    shared_gate_up_scale: torch.Tensor,
+    shared_down_weight: torch.Tensor,
+    shared_down_scale: torch.Tensor,
+    router_weight: torch.Tensor,
+) -> bool:
+    """Fail closed unless the router GEMM can also be folded into the grid."""
+
+    try:
+        from aiter.ops.flydsl.kimi_k3_moe_preroute_fp8 import (
+            supports_kimi_k3_moe_tri_projection_fp8,
+        )
+    except (ImportError, ModuleNotFoundError):
+        return False
+
+    return supports_kimi_k3_preroute_fp8(
+        hidden_states,
+        routed_weight,
+        routed_scale,
+        shared_gate_up_weight,
+        shared_gate_up_scale,
+        shared_down_weight,
+        shared_down_scale,
+    ) and supports_kimi_k3_moe_tri_projection_fp8(
+        hidden_states,
+        routed_weight,
+        routed_scale,
+        shared_gate_up_weight,
+        shared_gate_up_scale,
+        router_weight,
+    )
+
+
+def _kimi_k3_preroute_fp8_tri_impl(
+    hidden_states: torch.Tensor,
+    routed_weight: torch.Tensor,
+    routed_scale: torch.Tensor,
+    shared_gate_up_weight: torch.Tensor,
+    shared_gate_up_scale: torch.Tensor,
+    shared_down_weight: torch.Tensor,
+    shared_down_scale: torch.Tensor,
+    router_weight: torch.Tensor,
+    situ_beta: float,
+    situ_linear_beta: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from aiter.ops.flydsl.kimi_k3_moe_dual_projection import (
+        kimi_k3_shared_down_fp8_weight,
+    )
+    from aiter.ops.flydsl.kimi_k3_moe_preroute_fp8 import (
+        kimi_k3_moe_tri_projection_fp8,
+    )
+
+    routed, shared_gate_up, router_logits = kimi_k3_moe_tri_projection_fp8(
+        hidden_states,
+        routed_weight,
+        routed_scale,
+        shared_gate_up_weight,
+        shared_gate_up_scale,
+        router_weight,
+    )
+    shared_output = kimi_k3_shared_down_fp8_weight(
+        shared_gate_up,
+        shared_down_weight,
+        shared_down_scale,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+    )
+    return routed, shared_output, router_logits
+
+
+def _kimi_k3_preroute_fp8_tri_fake(
+    hidden_states: torch.Tensor,
+    routed_weight: torch.Tensor,
+    routed_scale: torch.Tensor,
+    shared_gate_up_weight: torch.Tensor,
+    shared_gate_up_scale: torch.Tensor,
+    shared_down_weight: torch.Tensor,
+    shared_down_scale: torch.Tensor,
+    router_weight: torch.Tensor,
+    situ_beta: float,
+    situ_linear_beta: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del (
+        routed_scale,
+        shared_gate_up_weight,
+        shared_gate_up_scale,
+        shared_down_weight,
+        shared_down_scale,
+        situ_beta,
+        situ_linear_beta,
+    )
+    return (
+        hidden_states.new_empty((hidden_states.shape[0], routed_weight.shape[0])),
+        hidden_states.new_empty((hidden_states.shape[0], hidden_states.shape[1])),
+        hidden_states.new_empty(
+            (hidden_states.shape[0], router_weight.shape[0]),
+            dtype=torch.float32,
+        ),
+    )
+
+
+direct_register_custom_op(
+    op_name="kimi_k3_preroute_fp8_tri",
+    op_func=_kimi_k3_preroute_fp8_tri_impl,
+    mutates_args=[],
+    fake_impl=_kimi_k3_preroute_fp8_tri_fake,
+    dispatch_key=current_platform.dispatch_key,
+)
+
+
+def kimi_k3_preroute_fp8_tri(
+    hidden_states: torch.Tensor,
+    routed_weight: torch.Tensor,
+    routed_scale: torch.Tensor,
+    shared_gate_up_weight: torch.Tensor,
+    shared_gate_up_scale: torch.Tensor,
+    shared_down_weight: torch.Tensor,
+    shared_down_scale: torch.Tensor,
+    router_weight: torch.Tensor,
+    situ_beta: float,
+    situ_linear_beta: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the B1 pre-route cluster with the router GEMM folded in."""
+
+    return torch.ops.vllm.kimi_k3_preroute_fp8_tri(
+        hidden_states,
+        routed_weight,
+        routed_scale,
+        shared_gate_up_weight,
+        shared_gate_up_scale,
+        shared_down_weight,
+        shared_down_scale,
+        router_weight,
+        situ_beta,
+        situ_linear_beta,
+    )
