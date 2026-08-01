@@ -178,9 +178,9 @@ class KimiAMDLatentMoERunner(MoERunner):
         self,
         shared_output: torch.Tensor | None,
         fused_output: torch.Tensor,
-    ) -> tuple[torch.Tensor | None, torch.Tensor]:
-        shared_output, fused_output = super()._maybe_apply_routed_scale_to_output(
-            shared_output, fused_output
+    ) -> tuple[torch.Tensor | None, torch.Tensor, bool]:
+        shared_output, fused_output, transform_applied = (
+            super()._maybe_apply_routed_scale_to_output(shared_output, fused_output)
         )
         transform = self.routed_output_transform
         if shared_output is not None and isinstance(
@@ -188,21 +188,8 @@ class KimiAMDLatentMoERunner(MoERunner):
         ):
             result = transform.forward_with_shared(fused_output, shared_output)
             if result is not None:
-                return None, result
-        return shared_output, fused_output
-
-    def apply_routed_output_transform(
-        self,
-        fused_output: torch.Tensor,
-    ) -> torch.Tensor:
-        transform = self.routed_output_transform
-        if (
-            isinstance(transform, KimiRoutedOutputTransform)
-            # The fused tail returns the full up-projection width.
-            and fused_output.shape[-1] == transform.up_proj.weight.shape[0]
-        ):
-            return fused_output
-        return super().apply_routed_output_transform(fused_output)
+                return None, result, True
+        return shared_output, fused_output, transform_applied
 
 
 def _apply_attn_res(

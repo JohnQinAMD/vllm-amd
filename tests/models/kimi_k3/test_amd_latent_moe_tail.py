@@ -108,12 +108,12 @@ def test_runner_fuses_supported_tail_and_preserves_fallback(monkeypatch):
         "forward_with_shared",
         lambda routed, shared: fused_result,
     )
-    remaining_shared, result = runner._maybe_apply_routed_scale_to_output(
-        shared, routed
+    remaining_shared, result, transform_applied = (
+        runner._maybe_apply_routed_scale_to_output(shared, routed)
     )
     assert remaining_shared is None
     assert result is fused_result
-    assert runner.apply_routed_output_transform(result) is fused_result
+    assert transform_applied
 
     fallback_result = torch.tensor([[11.0, 12.0, 13.0, 14.0]])
     monkeypatch.setattr(
@@ -122,9 +122,10 @@ def test_runner_fuses_supported_tail_and_preserves_fallback(monkeypatch):
         lambda routed, shared: None,
     )
     monkeypatch.setattr(transform, "forward", lambda routed: fallback_result)
-    remaining_shared, result = runner._maybe_apply_routed_scale_to_output(
-        shared, routed
+    remaining_shared, result, transform_applied = (
+        runner._maybe_apply_routed_scale_to_output(shared, routed)
     )
     assert remaining_shared is shared
     assert result is routed
+    assert not transform_applied
     assert runner.apply_routed_output_transform(result) is fallback_result

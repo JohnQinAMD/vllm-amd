@@ -392,20 +392,23 @@ class MoERunner(MoERunnerInterface):
         self,
         shared_output: torch.Tensor | None,
         fused_output: torch.Tensor,
-    ) -> tuple[torch.Tensor | None, torch.Tensor]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor, bool]:
         """Apply routed_scaling_factor to the output with FP16 overflow
         protection.
 
         Scale the fused expert output by routed_scaling_factor. For FP16,
         avoid overflow by dividing shared_output by the scale instead
         (the decoder layer compensates with matching divisions).
+
+        Returns the shared output, routed output, and whether the routed output
+        transform has already been applied by an optimized subclass.
         """
         if self.routed_scaling_factor != 1.0:
             if fused_output.dtype != torch.float16 or shared_output is None:
                 fused_output *= self.routed_scaling_factor
             elif shared_output is not None:
                 shared_output *= 1.0 / self.routed_scaling_factor
-        return shared_output, fused_output
+        return shared_output, fused_output, False
 
     @property
     def _fused_output_is_reduced(self) -> bool:
@@ -761,12 +764,12 @@ class MoERunner(MoERunnerInterface):
             shared_output, fused_output_is_reduced
         )
 
-        shared_output, fused_output = self._maybe_apply_routed_scale_to_output(
-            shared_output, fused_output
+        shared_output, fused_output, routed_transform_applied = (
+            self._maybe_apply_routed_scale_to_output(shared_output, fused_output)
         )
 
-        # Apply output transform (e.g. latent -> full dim)
-        fused_output = self.apply_routed_output_transform(fused_output)
+        if not routed_transform_applied:
+            fused_output = self.apply_routed_output_transform(fused_output)
 
         if shared_output is not None:
             result = shared_output + fused_output
